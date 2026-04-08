@@ -33,11 +33,12 @@ Options:
   --trivy-exit-on-findings  Exit with code 1 if Trivy finds selected severities
   --no-trivy-ignore-unfixed Include unfixed vulnerabilities in scan results
   --output-file <file>      Write key=value outputs to file for CI consumption
-  --cosign-key <keyref>     Cosign key reference (file path or env://). Default: keyless/OIDC
+  --cosign-key <keyref>     Cosign key reference (file path or env://). If set, keyed signing is added to keyless/OIDC
   --skip-sign               Skip signing (not recommended)
   --skip-sbom               Skip SBOM generation
   --skip-scan               Skip Trivy vulnerability scan
-  --no-sign-tags            Only sign digests (default signs digests and tags)
+  --sign-tags               Sign tags in addition to digests (default signs digests only)
+  --no-sign-tags            Only sign digests (default)
   --context <dir>           Build context (default: .)
   --help                    Show this message
 
@@ -78,7 +79,8 @@ COSIGN_KEY=""
 SKIP_SIGN=false
 SKIP_SBOM=false
 SKIP_SCAN=false
-SIGN_TAGS=true
+# Default: only sign digests. Tag signing can be enabled explicitly if needed.
+SIGN_TAGS=false
 CONTEXT="."
 
 while [[ $# -gt 0 ]]; do
@@ -145,6 +147,10 @@ while [[ $# -gt 0 ]]; do
 		;;
 	--skip-scan)
 		SKIP_SCAN=true
+		shift
+		;;
+	--sign-tags)
+		SIGN_TAGS=true
 		shift
 		;;
 	--no-sign-tags)
@@ -338,10 +344,30 @@ BUILD_CMD+=("${CONTEXT}")
 log "building and pushing images for ${VERSION}"
 "${BUILD_CMD[@]}"
 
-DIGEST="$(jq -r '."containerimage.digest"' "${METADATA_FILE}")"
-if [[ -z $DIGEST || $DIGEST == null ]]; then
-	die "failed to read image digest from build metadata"
-fi
+get_digest() {
+	local ref="$1"
+	local digest=""
+
+	# Primary: structured buildx output (robust for multi-arch images)
+	digest="$(docker buildx imagetools inspect "$ref" --format '{{.Manifest.Digest}}' 2>/dev/null || true)"
+
+	# Fallback: plain text parsing
+	if ! [[ $digest =~ ^sha256:[0-9a-f]{64}$ ]]; then
+		digest="$(docker buildx imagetools inspect "$ref" 2>/dev/null | awk '/^Digest:/ {print $2; exit}' || true)"
+	fi
+
+	if ! [[ $digest =~ ^sha256:[0-9a-f]{64}$ ]]; then
+		echo "failed to resolve digest for ${ref}" >&2
+		docker buildx imagetools inspect "$ref" || true
+		return 1
+	fi
+
+	echo "$digest"
+	return 0
+}
+
+# Resolve the digest from the registry to avoid depending on local build metadata.
+DIGEST="$(get_digest "${IMAGES_LOWER[0]}:${VERSION}")" || die "failed to resolve image digest from registry"
 
 PRIMARY_IMAGE="${IMAGES_LOWER[0]}"
 PRIMARY_REF="${PRIMARY_IMAGE}@${DIGEST}"
@@ -407,28 +433,33 @@ if ! $SKIP_SIGN; then
 	export COSIGN_YES=1
 	export COSIGN_DOCKER_MEDIA_TYPES=1
 	# sign_ref signs an image reference.
-	# The --recursive flag ensures all images in a multi-arch manifest are signed,
-	# not just the manifest itself. This is important for security as it provides
-	# cryptographic verification of each platform-specific image.
+	# We only use --recursive for digest refs. This matches the more reliable
+	# pattern used in the reference pipeline and avoids redundant registry writes
+	# for tag-based signatures.
 	sign_ref() {
 		local target="$1"
-		# Keyless signature (works with modern cosign)
-		cosign sign --yes --recursive "$target"
+		local recursive_args=()
+		if [[ $target == *@sha256:* ]]; then
+			recursive_args=(--recursive)
+		fi
 
-		# Keyed signature (if configured)
+		# Keyless signature
+		cosign sign --yes "${recursive_args[@]}" "$target"
+
+		# Keyed signature
 		if [[ -n $COSIGN_KEY ]]; then
-			cosign sign --key "$COSIGN_KEY" --yes --recursive "$target"
+			cosign sign --key "$COSIGN_KEY" --yes "${recursive_args[@]}" "$target"
 		fi
 		return 0
 	}
 	attest_sbom() {
 		local target="$1"
-		# Keyless attestation (if SBOM present)
+		# Keyless attestation
 		if [[ -n ${SBOM_PATH:-} ]]; then
 			cosign attest --type spdxjson --predicate "$SBOM_PATH" "$target"
 		fi
 
-		# Keyed attestation (if configured)
+		# Keyed attestation
 		if [[ -n $COSIGN_KEY && -n ${SBOM_PATH:-} ]]; then
 			cosign attest --key "$COSIGN_KEY" --type spdxjson --predicate "$SBOM_PATH" "$target"
 		fi
@@ -438,6 +469,8 @@ if ! $SKIP_SIGN; then
 		ref="${image}@${DIGEST}"
 		log "signing ${ref}"
 		sign_ref "$ref"
+
+		# Optional tag signing remains available, but digest signing is the default.
 		if $SIGN_TAGS; then
 			log "signing ${image}:${VERSION}"
 			sign_ref "${image}:${VERSION}"

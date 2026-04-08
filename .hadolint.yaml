@@ -6,14 +6,6 @@ no-fail: false
 disable-ignore-pragma: false
 
 strict-labels: false
-label-schema:
-  author: text
-  contact: email
-  created: rfc3339
-  version: semver
-  documentation: url
-  git-revision: hash
-  license: spdx
 
 trustedRegistries:
   - docker.io

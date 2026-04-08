@@ -45,24 +45,24 @@ hadolint Dockerfile
 
 ## Debugging checklist
 
-* Does failure reproduce locally?
-* Tool versions match CI?
-* Path or OS differences?
-* Missing dependencies?
+- Does failure reproduce locally?
+- Tool versions match CI?
+- Path or OS differences?
+- Missing dependencies?
 
 ---
 
 ## Rules
 
-* Do NOT disable checks
-* Do NOT weaken lint rules
-* Fix root cause only
+- Do NOT disable checks
+- Do NOT weaken lint rules
+- Fix root cause only
 
 ---
 
 ## Output
 
-* Root cause
-* Minimal fix
-* Commands run
-* Files affected
+- Root cause
+- Minimal fix
+- Commands run
+- Files affected

@@ -1,4 +1,8 @@
 extends: default
+
+ignore: |
+  test/crds/traefik/**
+
 rules:
   document-start: disable
   truthy: disable
