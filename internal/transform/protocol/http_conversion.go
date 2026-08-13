@@ -8,9 +8,15 @@ import (
 	"strings"
 
 	logrus "github.com/sirupsen/logrus"
+	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 
 	"pangolin-kube-controller/internal/config"
+	"pangolin-kube-controller/internal/transform/sanitize"
 )
+
+// ArtifactProtocolLabel scopes generated Kubernetes resources by protocol.
+const ArtifactProtocolLabel = "pangolin-kube-controller/protocol"
 
 type kubeServiceTarget struct {
 	name      string
@@ -21,39 +27,88 @@ type kubeServiceTarget struct {
 
 // ProcessServices rewrites TraefikService specs for load balancer conversions and logging.
 func ProcessServices(cfg *config.Config, services map[string]json.RawMessage) map[string]json.RawMessage {
-	if services == nil {
-		return nil
-	}
-	out := make(map[string]json.RawMessage, len(services))
-	for name, raw := range services {
-		out[name] = processSingleService(cfg, name, raw)
-	}
-	return out
+	processed, _, _, _ := ProcessHTTPServices(cfg, services, "")
+	return processed
 }
 
 func processSingleService(cfg *config.Config, name string, raw json.RawMessage) json.RawMessage {
+	processed, _, _, _ := processSingleHTTPService(cfg, "", name, raw)
+	return processed
+}
+
+// ProcessHTTPServices rewrites HTTP service specs and builds Kubernetes
+// artifacts for load balancers whose servers are not Kubernetes Services.
+func ProcessHTTPServices(cfg *config.Config, services map[string]json.RawMessage, namespace string) (map[string]json.RawMessage, []*corev1.Service, []*discoveryv1.EndpointSlice, error) {
+	if services == nil {
+		return nil, nil, nil, nil
+	}
+	out := make(map[string]json.RawMessage, len(services))
+	var kubeServices []*corev1.Service
+	var endpointSlices []*discoveryv1.EndpointSlice
+	for name, raw := range services {
+		processed, svc, endpointSlice, err := processSingleHTTPService(cfg, namespace, name, raw)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("process HTTP service %s: %w", name, err)
+		}
+		out[name] = processed
+		if svc != nil {
+			kubeServices = append(kubeServices, svc)
+			endpointSlices = append(endpointSlices, endpointSlice)
+		}
+	}
+	return out, kubeServices, endpointSlices, nil
+}
+
+func processSingleHTTPService(cfg *config.Config, namespace, name string, raw json.RawMessage) (json.RawMessage, *corev1.Service, *discoveryv1.EndpointSlice, error) {
 	trim := strings.TrimSpace(string(raw))
 	if trim != "" && trim != "{}" {
-		return processNonEmptyService(name, raw)
+		return processNonEmptyHTTPService(namespace, name, raw)
 	}
-	return processEmptyService(cfg, name, raw)
+	return processEmptyService(cfg, name, raw), nil, nil, nil
 }
 
 func processNonEmptyService(name string, raw json.RawMessage) json.RawMessage {
+	processed, _, _, _ := processNonEmptyHTTPService("", name, raw)
+	return processed
+}
+
+func processNonEmptyHTTPService(namespace, name string, raw json.RawMessage) (json.RawMessage, *corev1.Service, *discoveryv1.EndpointSlice, error) {
 	var spec map[string]interface{}
-	if err := json.Unmarshal(raw, &spec); err == nil {
-		if target, ok := convertLoadBalancerToK8sService(spec); ok {
-			if b, err := json.Marshal(spec); err == nil {
-				raw = b
-				logrus.Infof("TraefikService %s converted to Kubernetes Service %s/%s port=%d scheme=%s", name, target.namespace, target.name, target.port, target.scheme)
-			} else {
-				logrus.Warnf("TraefikService %s conversion marshal failed: %v", name, err)
-			}
-		} else if urls := extractServiceURLs(spec); len(urls) > 0 {
+	if err := json.Unmarshal(raw, &spec); err != nil {
+		return raw, nil, nil, nil
+	}
+	if target, ok := convertLoadBalancerToK8sService(spec); ok {
+		converted, err := json.Marshal(spec)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("marshal Kubernetes Service reference: %w", err)
+		}
+		logrus.Infof("TraefikService %s converted to Kubernetes Service %s/%s port=%d scheme=%s", name, target.namespace, target.name, target.port, target.scheme)
+		return converted, nil, nil, nil
+	}
+	target, ok := parseExternalServiceTargets(spec)
+	if !ok || namespace == "" {
+		if urls := extractServiceURLs(spec); len(urls) > 0 {
 			logrus.Infof("TraefikService %s servers=%v", name, urls)
 		}
+		return raw, nil, nil, nil
 	}
-	return raw
+	kubeName := sanitize.SanitizeResourceName(fmt.Sprintf("%s-%d", name, target.port))
+	rewriteAsKubeService(spec, kubeName, namespace, target.port, target.scheme, target.serviceOptions)
+	converted, err := json.Marshal(spec)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("marshal external Service reference: %w", err)
+	}
+	svc := buildHeadlessService(namespace, kubeName, int32(target.port), corev1.ProtocolTCP)
+	svc.Labels = map[string]string{ArtifactProtocolLabel: "http"}
+	endpointSlice, err := buildEndpointSlice(namespace, kubeName, int32(target.port), target.hosts, corev1.ProtocolTCP)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	endpointSlice.Labels = map[string]string{
+		ArtifactProtocolLabel:        "http",
+		discoveryv1.LabelServiceName: kubeName,
+	}
+	return converted, svc, endpointSlice, nil
 }
 
 func processEmptyService(cfg *config.Config, name string, raw json.RawMessage) json.RawMessage {
@@ -118,18 +173,88 @@ func convertLoadBalancerToK8sService(spec map[string]interface{}) (*kubeServiceT
 	if !ok || target == nil {
 		return nil, false
 	}
-	serviceEntry := map[string]interface{}{
-		"name":      target.name,
-		"namespace": target.namespace,
-		"kind":      "Service",
-		"port":      target.port,
+	rewriteAsKubeService(spec, target.name, target.namespace, target.port, target.scheme, nil)
+	return target, true
+}
+
+type externalServiceTarget struct {
+	hosts          []string
+	port           int
+	scheme         string
+	serviceOptions map[string]interface{}
+}
+
+func parseExternalServiceTargets(spec map[string]interface{}) (*externalServiceTarget, bool) {
+	lb, ok := spec["loadBalancer"].(map[string]interface{})
+	if !ok {
+		return nil, false
 	}
-	if target.scheme == "https" {
+	servers, ok := lb["servers"].([]interface{})
+	if !ok {
+		return nil, false
+	}
+	serviceOptions := make(map[string]interface{}, len(lb)-1)
+	for key, value := range lb {
+		if key != "servers" {
+			serviceOptions[key] = value
+		}
+	}
+	var target *externalServiceTarget
+	for _, server := range servers {
+		serverMap, ok := server.(map[string]interface{})
+		if !ok || len(serverMap) != 1 {
+			return nil, false
+		}
+		rawURL, ok := serverMap["url"].(string)
+		if !ok {
+			return nil, false
+		}
+		parsed, err := netURLParse(rawURL)
+		if err != nil || validateExternalServiceURL(parsed, rawURL) != nil {
+			return nil, false
+		}
+		port := derivePort(parsed)
+		if target == nil {
+			target = &externalServiceTarget{port: port, scheme: parsed.Scheme, serviceOptions: serviceOptions}
+		} else if target.port != port || target.scheme != parsed.Scheme {
+			return nil, false
+		}
+		target.hosts = append(target.hosts, parsed.Hostname())
+	}
+	return target, target != nil
+}
+
+func validateExternalServiceURL(parsed *url.URL, raw string) error {
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return fmt.Errorf("unsupported scheme %s", parsed.Scheme)
+	}
+	if parsed.Hostname() == "" {
+		return fmt.Errorf("missing host")
+	}
+	if (parsed.Path != "" && parsed.Path != "/") || parsed.RawQuery != "" {
+		return fmt.Errorf("unsupported path or query components in %s", raw)
+	}
+	if strings.Contains(parsed.Hostname(), ".svc.") || strings.HasSuffix(parsed.Hostname(), ".svc") {
+		return fmt.Errorf("target is a Kubernetes Service")
+	}
+	return nil
+}
+
+func rewriteAsKubeService(spec map[string]interface{}, name, namespace string, port int, scheme string, options map[string]interface{}) {
+	serviceEntry := map[string]interface{}{
+		"name":      name,
+		"namespace": namespace,
+		"kind":      "Service",
+		"port":      port,
+	}
+	if scheme == "https" {
 		serviceEntry["scheme"] = "https"
+	}
+	for key, value := range options {
+		serviceEntry[key] = value
 	}
 	spec["weighted"] = map[string]interface{}{"services": []interface{}{serviceEntry}}
 	delete(spec, "loadBalancer")
-	return target, true
 }
 
 // extractLBServers validates top-level loadBalancer shape & returns servers list.
