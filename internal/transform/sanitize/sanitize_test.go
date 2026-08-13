@@ -79,6 +79,22 @@ func TestSanitizeTraefikConfig(t *testing.T) {
 	require.Contains(t, rawMws, sanitizedRedirectMw)
 }
 
+func TestSanitizeTraefikConfigPreservesTCPAndUDP(t *testing.T) {
+	tcp := &traefikconfig.TCPUDPConfig{
+		Routers:  map[string]json.RawMessage{"tcp-router": json.RawMessage(`{}`)},
+		Services: map[string]json.RawMessage{"tcp-service": json.RawMessage(`{}`)},
+	}
+	udp := &traefikconfig.TCPUDPConfig{
+		Routers:  map[string]json.RawMessage{"udp-router": json.RawMessage(`{}`)},
+		Services: map[string]json.RawMessage{"udp-service": json.RawMessage(`{}`)},
+	}
+
+	sanitized, err := SanitizeTraefikConfig(&traefikconfig.Config{TCP: tcp, UDP: udp})
+	require.NoError(t, err)
+	require.Same(t, tcp, sanitized.TCP)
+	require.Same(t, udp, sanitized.UDP)
+}
+
 func TestSanitizeTraefikConfigRewritesNestedReferences(t *testing.T) {
 	cfg := &traefikconfig.Config{
 		HTTP: traefikconfig.HTTPConfig{

@@ -125,6 +125,8 @@ func SanitizeTraefikConfig(cfg *traefikconfig.Config) (*traefikconfig.Config, er
 			Services:          make(map[string]json.RawMessage, len(cfg.HTTP.Services)),
 			ServersTransports: make(map[string]json.RawMessage, len(cfg.HTTP.ServersTransports)),
 		},
+		TCP: cfg.TCP,
+		UDP: cfg.UDP,
 	}
 	mappings := &nameMappings{
 		middlewares: make(map[string]string, len(cfg.HTTP.Middlewares)),
