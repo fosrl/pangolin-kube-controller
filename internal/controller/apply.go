@@ -211,11 +211,13 @@ func (c *Controller) applyDesiredObjects(ctx context.Context, dyn dynamic.Interf
 		SSAForce:  c.cfg.SSAForce,
 	}
 	metaCfg := apply.MetadataConfig{
-		ManagedLabelKey:   c.cfg.ManagedLabelKey,
-		ManagedLabelValue: c.cfg.ManagedLabelValue,
-		ManagedAnnoKey:    c.cfg.ManagedAnnoKey,
-		ManagedAnnoValue:  c.cfg.ManagedAnnoValue,
-		IngressClass:      c.cfg.IngressClass,
+		ManagedLabelKey:           c.cfg.ManagedLabelKey,
+		ManagedLabelValue:         c.cfg.ManagedLabelValue,
+		TraefikInstanceLabelKey:   c.cfg.TraefikInstanceLabelKey,
+		TraefikInstanceLabelValue: c.cfg.TraefikInstanceLabelValue,
+		ManagedAnnoKey:            c.cfg.ManagedAnnoKey,
+		ManagedAnnoValue:          c.cfg.ManagedAnnoValue,
+		IngressClass:              c.cfg.IngressClass,
 	}
 	for name := range objects {
 		if err := ops.Apply(ctx, name, objects[name], metaCfg); err != nil {

@@ -14,13 +14,16 @@ func GetMetadataMap(existing *unstructured.Unstructured, getter func(*unstructur
 }
 
 func UpdateMetadataField(existing map[string]string, key, desiredValue string, target map[string]interface{}) bool {
+	// Server-Side Apply requires every controller-owned desired field to be
+	// present on every apply. Omitting an unchanged field relinquishes it and
+	// can prune it from the live object. Only unrelated fields remain absent
+	// from this patch, so their ownership and values are preserved.
+	target[key] = desiredValue
 	if existing == nil {
-		target[key] = desiredValue
 		return true
 	}
 	val, ok := existing[key]
 	if !ok || val != desiredValue {
-		target[key] = desiredValue
 		return true
 	}
 	return false

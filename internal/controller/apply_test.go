@@ -1,8 +1,17 @@
 package controller
 
 import (
+	"context"
 	"encoding/json"
 	"testing"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/dynamic/fake"
+
+	"pangolin-kube-controller/internal/config"
+	traefikconfig "pangolin-kube-controller/internal/transform/config"
 )
 
 func TestBuildDesiredSet(t *testing.T) {
@@ -51,6 +60,66 @@ func TestBuildDesiredSet(t *testing.T) {
 				if _, ok := got[name]; !ok {
 					t.Errorf("buildDesiredSet() missing key %q", name)
 				}
+			}
+		})
+	}
+}
+
+func TestApplyDesiredObjectsPropagatesConfiguredTraefikIdentity(t *testing.T) {
+	t.Parallel()
+
+	const (
+		namespace     = "blue-ocean"
+		identityKey   = "routing.example.com/traefik-instance"
+		identityValue = "blue-ocean-edge"
+	)
+	resources := []struct {
+		resource string
+		kind     string
+	}{
+		{resource: "middlewares", kind: "MiddlewareList"},
+		{resource: "ingressroutes", kind: "IngressRouteList"},
+		{resource: "traefikservices", kind: "TraefikServiceList"},
+		{resource: "serverstransports", kind: "ServersTransportList"},
+		{resource: "ingressroutetcps", kind: "IngressRouteTCPList"},
+		{resource: "ingressrouteudps", kind: "IngressRouteUDPList"},
+		{resource: "serverstransporttcps", kind: "ServersTransportTCPList"},
+	}
+	listKinds := make(map[schema.GroupVersionResource]string, len(resources))
+	for _, item := range resources {
+		listKinds[schema.GroupVersionResource{
+			Group: traefikconfig.Group, Version: traefikconfig.Version, Resource: item.resource,
+		}] = item.kind
+	}
+	dyn := fake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(), listKinds)
+	c := NewController(&config.Config{
+		Namespace:                 namespace,
+		ManagedLabelKey:           "app.kubernetes.io/managed-by",
+		ManagedLabelValue:         "pangolin-kube-controller",
+		ManagedAnnoKey:            "pangolin.io/managed-by",
+		ManagedAnnoValue:          "pangolin-kube-controller",
+		TraefikInstanceLabelKey:   identityKey,
+		TraefikInstanceLabelValue: identityValue,
+	}, dyn, nil, nil)
+
+	for _, item := range resources {
+		t.Run(item.resource, func(t *testing.T) {
+			gvr := schema.GroupVersionResource{
+				Group: traefikconfig.Group, Version: traefikconfig.Version, Resource: item.resource,
+			}
+			name := "generated-" + item.resource
+			err := c.applyDesiredObjects(context.Background(), dyn, gvr, map[string]json.RawMessage{
+				name: json.RawMessage(`{}`),
+			})
+			if err != nil {
+				t.Fatalf("applyDesiredObjects() error = %v", err)
+			}
+			got, err := dyn.Resource(gvr).Namespace(namespace).Get(context.Background(), name, metav1.GetOptions{})
+			if err != nil {
+				t.Fatalf("get generated %s: %v", item.resource, err)
+			}
+			if got.GetLabels()[identityKey] != identityValue {
+				t.Fatalf("instance label = %q, want %q", got.GetLabels()[identityKey], identityValue)
 			}
 		})
 	}
