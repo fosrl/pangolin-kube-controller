@@ -188,14 +188,16 @@ func (c *Controller) applyIngressRoute(ctx context.Context, resIfc resources.Res
 		return nil
 	}
 	ops := &apply.IngressRouteOps{
-		ResIfc:            resIfc,
-		Namespace:         c.cfg.Namespace,
-		ManagedLabelKey:   c.cfg.ManagedLabelKey,
-		ManagedLabelValue: c.cfg.ManagedLabelValue,
-		ManagedAnnoKey:    c.cfg.ManagedAnnoKey,
-		ManagedAnnoValue:  c.cfg.ManagedAnnoValue,
-		IngressClass:      c.cfg.IngressClass,
-		ReadOnly:          c.cfg.ReadOnly,
+		ResIfc:                    resIfc,
+		Namespace:                 c.cfg.Namespace,
+		ManagedLabelKey:           c.cfg.ManagedLabelKey,
+		ManagedLabelValue:         c.cfg.ManagedLabelValue,
+		TraefikInstanceLabelKey:   c.cfg.TraefikInstanceLabelKey,
+		TraefikInstanceLabelValue: c.cfg.TraefikInstanceLabelValue,
+		ManagedAnnoKey:            c.cfg.ManagedAnnoKey,
+		ManagedAnnoValue:          c.cfg.ManagedAnnoValue,
+		IngressClass:              c.cfg.IngressClass,
+		ReadOnly:                  c.cfg.ReadOnly,
 	}
 	return ops.Apply(ctx, name, u)
 }
@@ -437,14 +439,16 @@ func (c *Controller) applyProtocolSlices(ctx context.Context, slices []*discover
 func (c *Controller) applyProtocolIngressRoutes(ctx context.Context, routes []map[string]interface{}, ingressRouteGVR schema.GroupVersionResource, kind string) error {
 	resIfc := resources.AdaptResource(c.dyn.Resource(ingressRouteGVR).Namespace(c.cfg.Namespace))
 	ops := &apply.IngressRouteOps{
-		ResIfc:            resIfc,
-		Namespace:         c.cfg.Namespace,
-		ManagedLabelKey:   c.cfg.ManagedLabelKey,
-		ManagedLabelValue: c.cfg.ManagedLabelValue,
-		ManagedAnnoKey:    c.cfg.ManagedAnnoKey,
-		ManagedAnnoValue:  c.cfg.ManagedAnnoValue,
-		IngressClass:      c.cfg.IngressClass,
-		ReadOnly:          c.cfg.ReadOnly,
+		ResIfc:                    resIfc,
+		Namespace:                 c.cfg.Namespace,
+		ManagedLabelKey:           c.cfg.ManagedLabelKey,
+		ManagedLabelValue:         c.cfg.ManagedLabelValue,
+		TraefikInstanceLabelKey:   c.cfg.TraefikInstanceLabelKey,
+		TraefikInstanceLabelValue: c.cfg.TraefikInstanceLabelValue,
+		ManagedAnnoKey:            c.cfg.ManagedAnnoKey,
+		ManagedAnnoValue:          c.cfg.ManagedAnnoValue,
+		IngressClass:              c.cfg.IngressClass,
+		ReadOnly:                  c.cfg.ReadOnly,
 	}
 	for _, m := range routes {
 		if err := ops.ApplySingle(ctx, m, kind); err != nil {

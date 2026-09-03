@@ -11,6 +11,7 @@ import (
 	"k8s.io/client-go/dynamic/fake"
 
 	"pangolin-kube-controller/internal/config"
+	"pangolin-kube-controller/internal/testutil"
 	traefikconfig "pangolin-kube-controller/internal/transform/config"
 )
 
@@ -92,6 +93,7 @@ func TestApplyDesiredObjectsPropagatesConfiguredTraefikIdentity(t *testing.T) {
 		}] = item.kind
 	}
 	dyn := fake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(), listKinds)
+	testutil.EnableSSAUpsert(dyn)
 	c := NewController(&config.Config{
 		Namespace:                 namespace,
 		ManagedLabelKey:           "app.kubernetes.io/managed-by",
