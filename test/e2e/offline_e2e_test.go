@@ -44,6 +44,7 @@ func TestOfflineE2EExtendedHTTPTCPUDP(t *testing.T) {
 		{Group: traefikGroupLocal, Version: "v1alpha1", Resource: "serverstransporttcps"}: "ServersTransportTCPList",
 	}
 	dyn := fake.NewSimpleDynamicClientWithCustomListKinds(sch, listKinds)
+	tst.EnableSSAUpsert(dyn)
 	kube := fakekube.NewClientset()
 
 	cfg := config.LoadFromEnv()

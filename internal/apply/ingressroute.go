@@ -17,46 +17,45 @@ import (
 const FieldManagerName = "pangolin-kube-controller"
 
 type IngressRouteOps struct {
-	ResIfc            resources.ResourceClient
-	Namespace         string
-	ManagedLabelKey   string
-	ManagedLabelValue string
-	ManagedAnnoKey    string
-	ManagedAnnoValue  string
-	IngressClass      string
-	ReadOnly          bool
+	ResIfc                    resources.ResourceClient
+	Namespace                 string
+	ManagedLabelKey           string
+	ManagedLabelValue         string
+	TraefikInstanceLabelKey   string
+	TraefikInstanceLabelValue string
+	ManagedAnnoKey            string
+	ManagedAnnoValue          string
+	IngressClass              string
+	ReadOnly                  bool
 }
 
 func (o *IngressRouteOps) Apply(ctx context.Context, name string, u map[string]interface{}) error {
 	if o.ReadOnly {
 		return nil
 	}
+	metaCfg := MetadataConfig{
+		ManagedLabelKey:           o.ManagedLabelKey,
+		ManagedLabelValue:         o.ManagedLabelValue,
+		TraefikInstanceLabelKey:   o.TraefikInstanceLabelKey,
+		TraefikInstanceLabelValue: o.TraefikInstanceLabelValue,
+		ManagedAnnoKey:            o.ManagedAnnoKey,
+		ManagedAnnoValue:          o.ManagedAnnoValue,
+		IngressClass:              o.IngressClass,
+	}
 	existing, err := o.ResIfc.Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
 		if errors.IsNotFound(err) {
-			meta, _ := BuildMetadataForApply(nil, name, o.Namespace, "IngressRoute", MetadataConfig{
-				ManagedLabelKey:   o.ManagedLabelKey,
-				ManagedLabelValue: o.ManagedLabelValue,
-				ManagedAnnoKey:    o.ManagedAnnoKey,
-				ManagedAnnoValue:  o.ManagedAnnoValue,
-				IngressClass:      o.IngressClass,
-			})
+			meta, _ := BuildMetadataForApply(nil, name, o.Namespace, "IngressRoute", metaCfg)
 			routing.AnnotateRouterEntryPointsIfPresent(u, meta)
 			u["metadata"] = meta
 			return CreateUnstructured(ctx, o.ResIfc, u, "IngressRoute")
 		}
 		return err
 	}
-	meta, force := BuildMetadataForApply(existing, name, o.Namespace, "IngressRoute", MetadataConfig{
-		ManagedLabelKey:   o.ManagedLabelKey,
-		ManagedLabelValue: o.ManagedLabelValue,
-		ManagedAnnoKey:    o.ManagedAnnoKey,
-		ManagedAnnoValue:  o.ManagedAnnoValue,
-		IngressClass:      o.IngressClass,
-	})
+	meta, force := BuildMetadataForApply(existing, name, o.Namespace, "IngressRoute", metaCfg)
 	routing.AnnotateRouterEntryPointsIfPresent(u, meta)
 	u["metadata"] = meta
-	return PatchUnstructured(ctx, o.ResIfc, name, u, existing, "IngressRoute", PatchConfig{Force: force, SSAForce: false})
+	return PatchUnstructured(ctx, o.ResIfc, name, u, existing, "IngressRoute", PatchConfig{Force: force, MetadataConfig: metaCfg})
 }
 
 func (o *IngressRouteOps) ApplySingle(ctx context.Context, m map[string]interface{}, kind string) error {
@@ -69,30 +68,27 @@ func (o *IngressRouteOps) ApplySingle(ctx context.Context, m map[string]interfac
 	if o.ReadOnly {
 		return nil
 	}
+	metaCfg := MetadataConfig{
+		ManagedLabelKey:           o.ManagedLabelKey,
+		ManagedLabelValue:         o.ManagedLabelValue,
+		TraefikInstanceLabelKey:   o.TraefikInstanceLabelKey,
+		TraefikInstanceLabelValue: o.TraefikInstanceLabelValue,
+		ManagedAnnoKey:            o.ManagedAnnoKey,
+		ManagedAnnoValue:          o.ManagedAnnoValue,
+		IngressClass:              o.IngressClass,
+	}
 	existing, err := o.ResIfc.Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
 		if errors.IsNotFound(err) {
-			meta, _ := BuildMetadataForApply(nil, name, o.Namespace, kind, MetadataConfig{
-				ManagedLabelKey:   o.ManagedLabelKey,
-				ManagedLabelValue: o.ManagedLabelValue,
-				ManagedAnnoKey:    o.ManagedAnnoKey,
-				ManagedAnnoValue:  o.ManagedAnnoValue,
-				IngressClass:      o.IngressClass,
-			})
+			meta, _ := BuildMetadataForApply(nil, name, o.Namespace, kind, metaCfg)
 			m["metadata"] = meta
 			return CreateUnstructured(ctx, o.ResIfc, m, kind)
 		}
 		return err
 	}
-	meta, force := BuildMetadataForApply(existing, name, o.Namespace, kind, MetadataConfig{
-		ManagedLabelKey:   o.ManagedLabelKey,
-		ManagedLabelValue: o.ManagedLabelValue,
-		ManagedAnnoKey:    o.ManagedAnnoKey,
-		ManagedAnnoValue:  o.ManagedAnnoValue,
-		IngressClass:      o.IngressClass,
-	})
+	meta, force := BuildMetadataForApply(existing, name, o.Namespace, kind, metaCfg)
 	m["metadata"] = meta
-	return PatchUnstructured(ctx, o.ResIfc, name, m, existing, kind, PatchConfig{Force: force, SSAForce: false})
+	return PatchUnstructured(ctx, o.ResIfc, name, m, existing, kind, PatchConfig{Force: force, MetadataConfig: metaCfg})
 }
 
 func logApplySingleMalformedInput(kind string, input map[string]interface{}, metaIn map[string]interface{}) {
