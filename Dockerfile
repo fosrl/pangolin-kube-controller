@@ -1,8 +1,8 @@
-# syntax=docker/dockerfile:1@sha256:87999aa3d42bdc6bea60565083ee17e86d1f3339802f543c0d03998580f9cb89
+# syntax=docker/dockerfile:1@sha256:ecfaec9ed6d810b56388c508f4121597bfbba70d41a6dfeee4d8cad5f295fc32
 ##### Stage 1: Build (pinned & minimal, multi-arch) #####
-FROM --platform=$BUILDPLATFORM golang@sha256:0178a641fbb4858c5f1b48e34bdaabe0350a330a1b1149aabd498d0699ff5fb2 AS build
+FROM --platform=$BUILDPLATFORM golang@sha256:cf6fca6641884b8433441b2b0652976f975e1d0fdd26d177eaaf8596087f3125 AS build
 # renovate: datasource=docker depName=golang versioning=docker
-# renovate-version: 1.26.5-alpine
+# renovate-version: 1.27.1-alpine
 
 WORKDIR /src
 
