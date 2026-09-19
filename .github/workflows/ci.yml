@@ -152,7 +152,7 @@ jobs:
 
       - name: actionlint (check GH workflows)
         continue-on-error: true
-        uses: reviewdog/action-actionlint@8b682e1e7e512151d73a6b9449cbff173846226e # v1.74
+        uses: reviewdog/action-actionlint@ab7138020abfe6cd20b742c82e5b7a9749fb5884 # v1.75
 
   test:
     name: Test & Coverage
@@ -372,7 +372,7 @@ jobs:
 
       # ---------- Image bauen für Image-Scan ----------
       - name: Setup Docker Buildx
-        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Build controller image (local)
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
