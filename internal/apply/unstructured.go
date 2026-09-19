@@ -56,8 +56,9 @@ type UnstructuredOps struct {
 }
 
 type PatchConfig struct {
-	Force    bool
-	SSAForce bool
+	Force          bool
+	SSAForce       bool
+	MetadataConfig MetadataConfig
 }
 
 type SSAOptions struct {
@@ -94,28 +95,23 @@ func (o *UnstructuredOps) Apply(ctx context.Context, name string, raw json.RawMe
 	var force bool
 	meta, force = BuildMetadataForApply(existing, name, o.Namespace, kind, metaCfg)
 	u["metadata"] = meta
-	return PatchUnstructured(ctx, resIfc, name, u, existing, kind, PatchConfig{Force: force, SSAForce: o.SSAForce})
+	return PatchUnstructured(ctx, resIfc, name, u, existing, kind, PatchConfig{
+		Force:          force,
+		SSAForce:       o.SSAForce,
+		MetadataConfig: metaCfg,
+	})
 }
 
 func CreateUnstructured(ctx context.Context, resIfc resources.ResourceClient, u map[string]interface{}, kind string) error {
-	bytes, err := json.Marshal(u)
+	patchBytes, err := json.Marshal(u)
 	if err != nil {
 		return err
 	}
 	obj := &unstructured.Unstructured{}
-	if err := obj.UnmarshalJSON(bytes); err != nil {
+	if err := obj.UnmarshalJSON(patchBytes); err != nil {
 		return err
 	}
-	createOpts := metav1.CreateOptions{}
-	if IgnoreFieldValidation(kind) {
-		createOpts.FieldValidation = metav1.FieldValidationIgnore
-	}
-	_, err = resIfc.Create(ctx, obj, createOpts)
-	if err != nil {
-		return err
-	}
-	logrus.Infof("Created %s %s", kind, obj.GetName())
-	return nil
+	return ApplySSAWithRetry(ctx, resIfc, obj.GetName(), patchBytes, kind, SSAOptions{})
 }
 
 func PatchUnstructured(ctx context.Context, resIfc resources.ResourceClient, name string, u map[string]interface{}, existing *unstructured.Unstructured, kind string, cfg PatchConfig) error {
@@ -125,11 +121,56 @@ func PatchUnstructured(ctx context.Context, resIfc resources.ResourceClient, nam
 		}
 	}
 	forceOverride := ForceNeededForMetadata(existing, u)
+	legacyAdoption := ShouldAdoptLegacySpec(existing, cfg.MetadataConfig)
 	patchBytes, err := json.Marshal(u)
 	if err != nil {
 		return err
 	}
-	return ApplySSAWithRetry(ctx, resIfc, name, patchBytes, kind, SSAOptions{Force: cfg.Force, ForceOverride: forceOverride, SSAForce: cfg.SSAForce})
+	return ApplySSAWithRetry(ctx, resIfc, name, patchBytes, kind, SSAOptions{Force: cfg.Force || legacyAdoption, ForceOverride: forceOverride, SSAForce: cfg.SSAForce})
+}
+
+func ShouldAdoptLegacySpec(existing *unstructured.Unstructured, cfg MetadataConfig) bool {
+	if existing == nil || !isControllerManaged(existing, cfg) {
+		return false
+	}
+
+	legacyOwnsSpec := false
+	for _, entry := range existing.GetManagedFields() {
+		if !managedFieldsEntryOwnsSpec(entry) {
+			continue
+		}
+		switch entry.Manager {
+		case FieldManager:
+			continue
+		case "controller":
+			if entry.Operation != metav1.ManagedFieldsOperationUpdate {
+				return false
+			}
+			legacyOwnsSpec = true
+		default:
+			return false
+		}
+	}
+	return legacyOwnsSpec
+}
+
+func isControllerManaged(existing *unstructured.Unstructured, cfg MetadataConfig) bool {
+	labels := existing.GetLabels()
+	annotations := existing.GetAnnotations()
+	return (cfg.ManagedLabelKey != "" && labels[cfg.ManagedLabelKey] == cfg.ManagedLabelValue) ||
+		(cfg.ManagedAnnoKey != "" && annotations[cfg.ManagedAnnoKey] == cfg.ManagedAnnoValue)
+}
+
+func managedFieldsEntryOwnsSpec(entry metav1.ManagedFieldsEntry) bool {
+	if entry.FieldsV1 == nil || len(entry.FieldsV1.Raw) == 0 {
+		return false
+	}
+	fields := map[string]interface{}{}
+	if err := json.Unmarshal(entry.FieldsV1.Raw, &fields); err != nil {
+		return false
+	}
+	_, ownsSpec := fields["f:spec"]
+	return ownsSpec
 }
 
 func DiffSpecKeys(existing *unstructured.Unstructured, desired map[string]interface{}) []string {

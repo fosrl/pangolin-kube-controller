@@ -2,6 +2,7 @@ package apply
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 
@@ -15,6 +16,90 @@ import (
 
 	"pangolin-kube-controller/internal/kube/resources"
 )
+
+func TestIngressRouteOpsPropagatesTraefikIdentity(t *testing.T) {
+	t.Parallel()
+
+	const unrelatedLabel = "example.com/owner"
+	client := &fakeResourceClient{}
+	ops := &IngressRouteOps{
+		ResIfc:                    client,
+		Namespace:                 TestNS,
+		ManagedLabelKey:           ManagedBy,
+		ManagedLabelValue:         Controller,
+		TraefikInstanceLabelKey:   InstanceLabelKeyFull,
+		TraefikInstanceLabelValue: InstanceLabelValueMyInstance,
+		ManagedAnnoKey:            AnnoKey,
+		ManagedAnnoValue:          AnnoVal,
+		IngressClass:              TraefikIngressClass,
+	}
+
+	desired := map[string]interface{}{
+		"apiVersion": "traefik.io/v1alpha1",
+		"kind":       "IngressRoute",
+		"metadata":   map[string]interface{}{"name": TestRoute},
+		"spec":       map[string]interface{}{},
+	}
+	require.NoError(t, ops.Apply(context.Background(), TestRoute, desired))
+	labels := patchLabels(t, client.patchBytes)
+	require.Equal(t, InstanceLabelValueMyInstance, labels[InstanceLabelKeyFull])
+	require.Equal(t, FieldManager, client.patchOptions.FieldManager)
+
+	client.existing = &unstructured.Unstructured{Object: map[string]interface{}{
+		"metadata": map[string]interface{}{
+			"name": TestRoute, "namespace": TestNS,
+			"labels":      map[string]interface{}{ManagedBy: Controller, unrelatedLabel: "platform"},
+			"annotations": map[string]interface{}{AnnoKey: AnnoVal},
+		},
+	}}
+	require.NoError(t, ops.Apply(context.Background(), TestRoute, desired))
+	labels = patchLabels(t, client.patchBytes)
+	require.Equal(t, InstanceLabelValueMyInstance, labels[InstanceLabelKeyFull])
+	require.NotContains(t, labels, unrelatedLabel)
+	require.NotNil(t, client.patchOptions.Force, "repairing missing managed identity must adopt SSA ownership")
+	require.True(t, *client.patchOptions.Force)
+
+	client.existing.SetLabels(map[string]string{
+		ManagedBy: Controller, unrelatedLabel: "platform", InstanceLabelKeyFull: InstanceLabelValueMyInstance,
+	})
+	client.existing.SetAnnotations(map[string]string{
+		AnnoKey: AnnoVal, "traefikconfig.ingress.kubernetes.io/router.ingressclass": TraefikIngressClass,
+	})
+	require.NoError(t, ops.Apply(context.Background(), TestRoute, desired))
+	labels = patchLabels(t, client.patchBytes)
+	require.Equal(t, InstanceLabelValueMyInstance, labels[InstanceLabelKeyFull])
+	require.NotContains(t, labels, unrelatedLabel)
+	require.Nil(t, client.patchOptions.Force, "repeated reconcile must not force unchanged ownership")
+}
+
+func TestIngressRouteOpsApplySinglePropagatesTraefikIdentity(t *testing.T) {
+	t.Parallel()
+	client := &fakeResourceClient{}
+	ops := &IngressRouteOps{
+		ResIfc: client, Namespace: TestNS,
+		ManagedLabelKey: ManagedBy, ManagedLabelValue: Controller,
+		TraefikInstanceLabelKey: InstanceLabelKeyFull, TraefikInstanceLabelValue: InstanceLabelValueMyInstance,
+		ManagedAnnoKey: AnnoKey, ManagedAnnoValue: AnnoVal,
+	}
+	require.NoError(t, ops.ApplySingle(context.Background(), map[string]interface{}{
+		"apiVersion": "traefik.io/v1alpha1",
+		"kind":       "IngressRouteTCP",
+		"metadata":   map[string]interface{}{"name": TestMW},
+		"spec":       map[string]interface{}{},
+	}, "IngressRouteTCP"))
+	require.Equal(t, InstanceLabelValueMyInstance, patchLabels(t, client.patchBytes)[InstanceLabelKeyFull])
+}
+
+func patchLabels(t *testing.T, patch []byte) map[string]interface{} {
+	t.Helper()
+	var obj map[string]interface{}
+	require.NoError(t, json.Unmarshal(patch, &obj))
+	meta, ok := obj["metadata"].(map[string]interface{})
+	require.True(t, ok)
+	labels, ok := meta["labels"].(map[string]interface{})
+	require.True(t, ok)
+	return labels
+}
 
 func TestIngressRouteOpsApplyReadOnly(t *testing.T) {
 	t.Parallel()
@@ -193,12 +278,14 @@ func TestIngressRouteOpsApplySingleGetError(t *testing.T) {
 
 type fakeResourceClient struct {
 	resources.ResourceClient
-	existing    *unstructured.Unstructured
-	getErr      error
-	createErr   error
-	patchErr    error
-	createCount int
-	patchCount  int
+	existing     *unstructured.Unstructured
+	getErr       error
+	createErr    error
+	patchErr     error
+	createCount  int
+	patchCount   int
+	patchBytes   []byte
+	patchOptions metav1.PatchOptions
 }
 
 func (c *fakeResourceClient) Get(_ context.Context, name string, _ metav1.GetOptions) (*unstructured.Unstructured, error) {
@@ -219,8 +306,10 @@ func (c *fakeResourceClient) Create(_ context.Context, obj *unstructured.Unstruc
 	return obj, nil
 }
 
-func (c *fakeResourceClient) Patch(_ context.Context, name string, _ types.PatchType, _ []byte, _ metav1.PatchOptions) (*unstructured.Unstructured, error) {
+func (c *fakeResourceClient) Patch(_ context.Context, name string, _ types.PatchType, patch []byte, options metav1.PatchOptions) (*unstructured.Unstructured, error) {
 	c.patchCount++
+	c.patchBytes = append([]byte(nil), patch...)
+	c.patchOptions = options
 	if c.patchErr != nil {
 		return nil, c.patchErr
 	}

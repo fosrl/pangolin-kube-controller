@@ -208,6 +208,25 @@ func TestResolveInstanceLabelConfiguredValidation(t *testing.T) {
 	})
 }
 
+func TestResolveInstanceLabelExplicitIdentityBypassesAutodetection(t *testing.T) {
+	t.Parallel()
+
+	const configuredIdentity = "edge-controller-blue"
+	cfg := &config.Config{
+		TraefikInstanceLabelKey:   "routing.example.com/instance",
+		TraefikInstanceLabelValue: configuredIdentity,
+		IngressClass:              "edge-traefik",
+	}
+	// A nil Kubernetes client makes any attempted IngressClass autodetection
+	// fail. Explicit identity must return before consulting cluster state.
+	if err := ResolveInstanceLabel(context.Background(), nil, cfg, nil); err != nil {
+		t.Fatalf("explicit identity unexpectedly attempted autodetection: %v", err)
+	}
+	if cfg.TraefikInstanceLabelValue != configuredIdentity {
+		t.Fatalf("TraefikInstanceLabelValue = %q, want %q", cfg.TraefikInstanceLabelValue, configuredIdentity)
+	}
+}
+
 func TestMonitorEmptyConfig(t *testing.T) {
 	t.Parallel()
 

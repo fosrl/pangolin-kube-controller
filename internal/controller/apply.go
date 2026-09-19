@@ -188,14 +188,16 @@ func (c *Controller) applyIngressRoute(ctx context.Context, resIfc resources.Res
 		return nil
 	}
 	ops := &apply.IngressRouteOps{
-		ResIfc:            resIfc,
-		Namespace:         c.cfg.Namespace,
-		ManagedLabelKey:   c.cfg.ManagedLabelKey,
-		ManagedLabelValue: c.cfg.ManagedLabelValue,
-		ManagedAnnoKey:    c.cfg.ManagedAnnoKey,
-		ManagedAnnoValue:  c.cfg.ManagedAnnoValue,
-		IngressClass:      c.cfg.IngressClass,
-		ReadOnly:          c.cfg.ReadOnly,
+		ResIfc:                    resIfc,
+		Namespace:                 c.cfg.Namespace,
+		ManagedLabelKey:           c.cfg.ManagedLabelKey,
+		ManagedLabelValue:         c.cfg.ManagedLabelValue,
+		TraefikInstanceLabelKey:   c.cfg.TraefikInstanceLabelKey,
+		TraefikInstanceLabelValue: c.cfg.TraefikInstanceLabelValue,
+		ManagedAnnoKey:            c.cfg.ManagedAnnoKey,
+		ManagedAnnoValue:          c.cfg.ManagedAnnoValue,
+		IngressClass:              c.cfg.IngressClass,
+		ReadOnly:                  c.cfg.ReadOnly,
 	}
 	return ops.Apply(ctx, name, u)
 }
@@ -211,11 +213,13 @@ func (c *Controller) applyDesiredObjects(ctx context.Context, dyn dynamic.Interf
 		SSAForce:  c.cfg.SSAForce,
 	}
 	metaCfg := apply.MetadataConfig{
-		ManagedLabelKey:   c.cfg.ManagedLabelKey,
-		ManagedLabelValue: c.cfg.ManagedLabelValue,
-		ManagedAnnoKey:    c.cfg.ManagedAnnoKey,
-		ManagedAnnoValue:  c.cfg.ManagedAnnoValue,
-		IngressClass:      c.cfg.IngressClass,
+		ManagedLabelKey:           c.cfg.ManagedLabelKey,
+		ManagedLabelValue:         c.cfg.ManagedLabelValue,
+		TraefikInstanceLabelKey:   c.cfg.TraefikInstanceLabelKey,
+		TraefikInstanceLabelValue: c.cfg.TraefikInstanceLabelValue,
+		ManagedAnnoKey:            c.cfg.ManagedAnnoKey,
+		ManagedAnnoValue:          c.cfg.ManagedAnnoValue,
+		IngressClass:              c.cfg.IngressClass,
 	}
 	for name := range objects {
 		if err := ops.Apply(ctx, name, objects[name], metaCfg); err != nil {
@@ -286,11 +290,26 @@ func deleteImmediate(ctx context.Context, resIfc resources.ResourceClient, name 
 }
 
 func (c *Controller) reconcileServices(ctx context.Context, dyn dynamic.Interface, gvr schema.GroupVersionResource, services map[string]json.RawMessage) error {
-	processed := protocol.ProcessServices(c.cfg, services)
+	processed, kubeServices, endpointSlices, err := protocol.ProcessHTTPServices(c.cfg, services, c.cfg.Namespace)
+	if err != nil {
+		return err
+	}
+	if err := c.applyProtocolServices(ctx, kubeServices); err != nil {
+		return err
+	}
+	if err := c.applyProtocolSlices(ctx, endpointSlices); err != nil {
+		return err
+	}
 	if err := c.applyDesiredObjects(ctx, dyn, gvr, processed); err != nil {
 		return err
 	}
-	return c.gcStaleObjects(ctx, dyn, gvr, processed, "TraefikService")
+	if err := c.gcStaleObjects(ctx, dyn, gvr, processed, "TraefikService"); err != nil {
+		return err
+	}
+	if err := c.gcStaleCoreServices(ctx, desiredServiceNames(kubeServices), "http"); err != nil {
+		return err
+	}
+	return c.gcStaleEndpointSlices(ctx, desiredEndpointSliceNames(endpointSlices), "http")
 }
 
 func (c *Controller) reconcileServersTransports(ctx context.Context, dyn dynamic.Interface, gvr schema.GroupVersionResource, transports map[string]json.RawMessage) error {
@@ -339,10 +358,10 @@ func (c *Controller) reconcileTCP(ctx context.Context, cfg *traefikconfig.Config
 	if err := c.gcStaleObjects(ctx, c.dyn, c.gvrIngressRouteTCP, desiredRoutes, "IngressRouteTCP"); err != nil {
 		return err
 	}
-	if err := c.gcStaleCoreServices(ctx, desiredSvc); err != nil {
+	if err := c.gcStaleCoreServices(ctx, desiredSvc, "tcp"); err != nil {
 		return err
 	}
-	if err := c.gcStaleEndpointSlices(ctx, desiredSlices); err != nil {
+	if err := c.gcStaleEndpointSlices(ctx, desiredSlices, "tcp"); err != nil {
 		return err
 	}
 	return nil
@@ -381,10 +400,10 @@ func (c *Controller) reconcileUDP(ctx context.Context, cfg *traefikconfig.Config
 	if err := c.gcStaleObjects(ctx, c.dyn, c.gvrIngressRouteUDP, desiredRoutes, "IngressRouteUDP"); err != nil {
 		return err
 	}
-	if err := c.gcStaleCoreServices(ctx, desiredSvc); err != nil {
+	if err := c.gcStaleCoreServices(ctx, desiredSvc, "udp"); err != nil {
 		return err
 	}
-	if err := c.gcStaleEndpointSlices(ctx, desiredSlices); err != nil {
+	if err := c.gcStaleEndpointSlices(ctx, desiredSlices, "udp"); err != nil {
 		return err
 	}
 	return nil
@@ -435,14 +454,16 @@ func (c *Controller) applyProtocolSlices(ctx context.Context, slices []*discover
 func (c *Controller) applyProtocolIngressRoutes(ctx context.Context, routes []map[string]interface{}, ingressRouteGVR schema.GroupVersionResource, kind string) error {
 	resIfc := resources.AdaptResource(c.dyn.Resource(ingressRouteGVR).Namespace(c.cfg.Namespace))
 	ops := &apply.IngressRouteOps{
-		ResIfc:            resIfc,
-		Namespace:         c.cfg.Namespace,
-		ManagedLabelKey:   c.cfg.ManagedLabelKey,
-		ManagedLabelValue: c.cfg.ManagedLabelValue,
-		ManagedAnnoKey:    c.cfg.ManagedAnnoKey,
-		ManagedAnnoValue:  c.cfg.ManagedAnnoValue,
-		IngressClass:      c.cfg.IngressClass,
-		ReadOnly:          c.cfg.ReadOnly,
+		ResIfc:                    resIfc,
+		Namespace:                 c.cfg.Namespace,
+		ManagedLabelKey:           c.cfg.ManagedLabelKey,
+		ManagedLabelValue:         c.cfg.ManagedLabelValue,
+		TraefikInstanceLabelKey:   c.cfg.TraefikInstanceLabelKey,
+		TraefikInstanceLabelValue: c.cfg.TraefikInstanceLabelValue,
+		ManagedAnnoKey:            c.cfg.ManagedAnnoKey,
+		ManagedAnnoValue:          c.cfg.ManagedAnnoValue,
+		IngressClass:              c.cfg.IngressClass,
+		ReadOnly:                  c.cfg.ReadOnly,
 	}
 	for _, m := range routes {
 		if err := ops.ApplySingle(ctx, m, kind); err != nil {
@@ -523,9 +544,26 @@ func (c *Controller) ensureManagedEndpointSliceMeta(es *discoveryv1.EndpointSlic
 	es.Annotations[c.cfg.ManagedAnnoKey] = c.cfg.ManagedAnnoValue
 }
 
-func (c *Controller) gcStaleCoreServices(ctx context.Context, desired map[string]json.RawMessage) error {
+func desiredServiceNames(services []*corev1.Service) map[string]json.RawMessage {
+	desired := make(map[string]json.RawMessage, len(services))
+	for _, service := range services {
+		desired[service.Name] = json.RawMessage("{}")
+	}
+	return desired
+}
+
+func desiredEndpointSliceNames(endpointSlices []*discoveryv1.EndpointSlice) map[string]json.RawMessage {
+	desired := make(map[string]json.RawMessage, len(endpointSlices))
+	for _, endpointSlice := range endpointSlices {
+		desired[endpointSlice.Name] = json.RawMessage("{}")
+	}
+	return desired
+}
+
+func (c *Controller) gcStaleCoreServices(ctx context.Context, desired map[string]json.RawMessage, protocolName string) error {
 	cli := c.kube.CoreV1().Services(c.cfg.Namespace)
-	list, err := cli.List(ctx, metav1.ListOptions{LabelSelector: fmt.Sprintf("%s=%s", c.cfg.ManagedLabelKey, c.cfg.ManagedLabelValue)})
+	selector := fmt.Sprintf("%s=%s,%s=%s", c.cfg.ManagedLabelKey, c.cfg.ManagedLabelValue, protocol.ArtifactProtocolLabel, protocolName)
+	list, err := cli.List(ctx, metav1.ListOptions{LabelSelector: selector})
 	if err != nil {
 		return err
 	}
@@ -542,9 +580,10 @@ func (c *Controller) gcStaleCoreServices(ctx context.Context, desired map[string
 	return nil
 }
 
-func (c *Controller) gcStaleEndpointSlices(ctx context.Context, desired map[string]json.RawMessage) error {
+func (c *Controller) gcStaleEndpointSlices(ctx context.Context, desired map[string]json.RawMessage, protocolName string) error {
 	cli := c.kube.DiscoveryV1().EndpointSlices(c.cfg.Namespace)
-	list, err := cli.List(ctx, metav1.ListOptions{LabelSelector: fmt.Sprintf("%s=%s", c.cfg.ManagedLabelKey, c.cfg.ManagedLabelValue)})
+	selector := fmt.Sprintf("%s=%s,%s=%s", c.cfg.ManagedLabelKey, c.cfg.ManagedLabelValue, protocol.ArtifactProtocolLabel, protocolName)
+	list, err := cli.List(ctx, metav1.ListOptions{LabelSelector: selector})
 	if err != nil {
 		return err
 	}

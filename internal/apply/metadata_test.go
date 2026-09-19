@@ -76,6 +76,9 @@ func TestUpdateMetadataField(t *testing.T) {
 		if got {
 			t.Error("UpdateMetadataField() = true, want false for unchanged value")
 		}
+		if target["key"] != "value" {
+			t.Errorf("target[key] = %v, want value retained in SSA payload", target["key"])
+		}
 	})
 
 	t.Run("existing value different", func(t *testing.T) {
@@ -147,11 +150,13 @@ func TestBuildMetadataForApplyUpdateSameValuesNoForce(t *testing.T) {
 	if force {
 		t.Error("force = true, want false when existing matches")
 	}
-	if _, hasLabels := meta["labels"]; hasLabels {
-		t.Error("meta should not have labels when unchanged")
+	labels := meta["labels"].(map[string]interface{})
+	if labels[managedLabelKey] != managedLabelValue || labels[instanceLabelKey] != instanceLabelVal {
+		t.Errorf("unchanged controller-owned labels missing from SSA payload: %v", labels)
 	}
-	if _, hasAnnotations := meta["annotations"]; hasAnnotations {
-		t.Error("meta should not have annotations when unchanged")
+	annotations := meta["annotations"].(map[string]interface{})
+	if annotations[managedAnnoKey] != managedAnnoValue {
+		t.Errorf("unchanged controller-owned annotation missing from SSA payload: %v", annotations)
 	}
 }
 
@@ -172,6 +177,36 @@ func TestBuildMetadataForApplyUpdateDifferentValuesForces(t *testing.T) {
 	labels := meta["labels"].(map[string]interface{})
 	if labels[managedLabelKey] != managedLabelValue {
 		t.Errorf("labels[managed] = %v, want %s", labels[managedLabelKey], managedLabelValue)
+	}
+}
+
+func TestBuildMetadataForApplyPreservesUnrelatedExistingLabels(t *testing.T) {
+	cfg := defaultMetadataConfig()
+	existing := &unstructured.Unstructured{}
+	existing.SetLabels(map[string]string{
+		"user.example.com/owner": "platform",
+		managedLabelKey:          managedLabelValue,
+	})
+
+	meta, _ := BuildMetadataForApply(existing, resourceName, testNamespace, "Middleware", cfg)
+	labels := meta["labels"].(map[string]interface{})
+	if _, overwritten := labels["user.example.com/owner"]; overwritten {
+		t.Fatal("unrelated existing label was included in the controller patch")
+	}
+	if labels[instanceLabelKey] != instanceLabelVal {
+		t.Fatalf("instance label = %v, want %s", labels[instanceLabelKey], instanceLabelVal)
+	}
+}
+
+func TestBuildMetadataForApplyWithoutConfiguredIdentity(t *testing.T) {
+	cfg := defaultMetadataConfig()
+	cfg.TraefikInstanceLabelKey = ""
+	cfg.TraefikInstanceLabelValue = ""
+
+	meta, _ := BuildMetadataForApply(nil, resourceName, testNamespace, "Middleware", cfg)
+	labels := meta["labels"].(map[string]interface{})
+	if _, invented := labels[instanceLabelKey]; invented {
+		t.Fatalf("unexpected invented instance label: %v", labels)
 	}
 }
 

@@ -76,11 +76,14 @@ func buildTCPKubeArtifacts(namespace string, keys []string, info map[string]tcpS
 		meta := info[dyn]
 		kubeName := sanitize.SanitizeResourceName(fmt.Sprintf("%s-%d", dyn, meta.port))
 		nameMap[dyn] = kubeName
-		svcs = append(svcs, buildHeadlessService(namespace, kubeName, meta.port, corev1.ProtocolTCP))
+		svc := buildHeadlessService(namespace, kubeName, meta.port, corev1.ProtocolTCP)
+		svc.Labels = map[string]string{ArtifactProtocolLabel: "tcp"}
+		svcs = append(svcs, svc)
 		eps, e := buildEndpointSlice(namespace, kubeName, meta.port, meta.hosts, corev1.ProtocolTCP)
 		if e != nil {
 			return nil, nil, nil, e
 		}
+		eps.Labels = map[string]string{ArtifactProtocolLabel: "tcp", discoveryv1.LabelServiceName: kubeName}
 		slices = append(slices, eps)
 	}
 	return nameMap, svcs, slices, nil
@@ -219,11 +222,14 @@ func buildUDPKubeArtifacts(namespace string, keys []string, info map[string]udpS
 		meta := info[dyn]
 		kubeName := sanitize.SanitizeResourceName(fmt.Sprintf("%s-%d", dyn, meta.port))
 		nameMap[dyn] = kubeName
-		svcs = append(svcs, buildHeadlessService(namespace, kubeName, meta.port, corev1.ProtocolUDP))
+		svc := buildHeadlessService(namespace, kubeName, meta.port, corev1.ProtocolUDP)
+		svc.Labels = map[string]string{ArtifactProtocolLabel: "udp"}
+		svcs = append(svcs, svc)
 		eps, e := buildEndpointSlice(namespace, kubeName, meta.port, meta.hosts, corev1.ProtocolUDP)
 		if e != nil {
 			return nil, nil, nil, e
 		}
+		eps.Labels = map[string]string{ArtifactProtocolLabel: "udp", discoveryv1.LabelServiceName: kubeName}
 		slices = append(slices, eps)
 	}
 	return nameMap, svcs, slices, nil
