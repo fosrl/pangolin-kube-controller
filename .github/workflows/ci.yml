@@ -99,7 +99,7 @@ jobs:
         continue-on-error: true
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
-          version: v2.13.2
+          version: v2.14.0
           only-new-issues: true
           args: --timeout=5m
 
@@ -152,7 +152,7 @@ jobs:
 
       - name: actionlint (check GH workflows)
         continue-on-error: true
-        uses: reviewdog/action-actionlint@ab7138020abfe6cd20b742c82e5b7a9749fb5884 # v1.75
+        uses: reviewdog/action-actionlint@1129829fb3230509a1c9aa4e93cec2b234746a68 # v1.78
 
   test:
     name: Test & Coverage
