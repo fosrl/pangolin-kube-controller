@@ -179,7 +179,7 @@ jobs:
       - name: Install Trivy CLI
         uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567 # v0.3.1
         with:
-          version: v0.74.0
+          version: v0.75.0
 
       - name: Ensure release script permissions
         run: chmod +x hack/scripts/release.sh
@@ -258,7 +258,7 @@ jobs:
 
       - name: Upload SBOM artifact
         if: steps.run-release.outputs.sbom != ''
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sbom-${{ env.TAG }}
           path: ${{ steps.run-release.outputs.sbom }}
@@ -293,7 +293,7 @@ jobs:
 
       - name: Upload release artifacts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-artifacts-${{ inputs.tag }}
           path: artifacts
