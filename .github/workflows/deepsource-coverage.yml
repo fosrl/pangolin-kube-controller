@@ -17,7 +17,7 @@ permissions:
 jobs:
   coverage:
     name: Run tests and report coverage to DeepSource
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     env:
       # Expose DSN via env for conditional checks without referencing `secrets` in expressions
       DEEPSOURCE_DSN: ${{ secrets.DEEPSOURCE_DSN }}
