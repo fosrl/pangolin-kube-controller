@@ -12,7 +12,9 @@
   "automerge": false,
   "minimumReleaseAge": "3 days",
   "timezone": "Europe/Berlin",
-  "dependencyDashboard": true,
+  "dependencyDashboard": {
+    "enabled": true
+  },
   "addLabels": ["dependencies"],
   "reviewers": ["marcschaeferger"],
   "prConcurrentLimit": 20,
