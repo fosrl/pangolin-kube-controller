@@ -20,12 +20,19 @@ func (c *Controller) runLoop(ctx context.Context) {
 	var lastETagIsHeader bool
 	var consecutiveErrors int
 	var lastFetchInfoLog time.Time
+	var lastApplied time.Time
 	for {
 		if ctx.Err() != nil {
 			logrus.Info("Context cancelled, shutting down main loop.")
 			return
 		}
 		start := time.Now()
+		if c.resyncDue(start, lastApplied) {
+			// Forget what was applied so this pass fetches and applies the
+			// full config even if it is unchanged.
+			logrus.Debugf("Resync interval %s elapsed; forcing a full apply", c.cfg.ResyncInterval)
+			lastETag, lastHash, lastETagIsHeader = "", "", false
+		}
 		logAtInfo := c.shouldLogFetchInfo(start, lastFetchInfoLog)
 		lastFetchInfoLog = c.logPollingStart(logAtInfo, start, lastFetchInfoLog)
 
@@ -49,6 +56,7 @@ func (c *Controller) runLoop(ctx context.Context) {
 		}
 
 		c.updateSignaturesAfterSuccess(etagHeaderAdj, cfgBody, &lastETag, &lastETagIsHeader, &lastHash)
+		lastApplied = time.Now()
 		c.recordSyncSuccess(start)
 		c.sleepWithBackoff(ctx, 0)
 	}
@@ -276,4 +284,13 @@ func (c *Controller) updateSignaturesAfterSuccess(etag string, body []byte, last
 		*lastETagIsHeader = false
 	}
 	*lastHash = c.computeHash(body)
+}
+
+// resyncDue reports whether the resync interval has elapsed since the last
+// successful apply.
+func (c *Controller) resyncDue(now, lastApplied time.Time) bool {
+	if c.cfg.ResyncInterval <= 0 || lastApplied.IsZero() {
+		return false
+	}
+	return now.Sub(lastApplied) >= c.cfg.ResyncInterval
 }

@@ -86,7 +86,7 @@ The **Pangolin Kubernetes Controller** automatically synchronizes dynamic Traefi
       spec:
         containers:
           - name: controller
-            image: ghcr.io/fosrl/pangolin-kube-controller:0.1.0-alpha.1
+            image: ghcr.io/fosrl/pangolin-kube-controller:0.1.0
             env:
               - name: CONFIG_ENDPOINT
                 value: "https://your-pangolin:3001/api/v1/traefik-config"
@@ -134,11 +134,45 @@ For a production deployment, review and adjust the RBAC scope, resource limits, 
 
 ## **Supported resource kinds**
 
-  Out of the box the controller targets common Traefik CRDs. Example list (expandable via configuration/code):
+The controller writes these objects into `TARGET_NAMESPACE`:
 
-- IngressRoute
-- Middleware
-- TraefikService
+| Pangolin dynamic config | Kubernetes objects |
+| --- | --- |
+| `http.routers` | `IngressRoute` |
+| `http.middlewares` | `Middleware` (`chain` members become `MiddlewareRef` objects) |
+| `http.services` | `TraefikService` (`weighted`) plus selectorless `Service` + `EndpointSlice` per backend group |
+| `http.serversTransports` | `ServersTransport` |
+| `tcp.routers` / `tcp.services` | `IngressRouteTCP` plus `Service` + `EndpointSlice` |
+| `tcp.serversTransports` and `pp-transport-v<N>@file` references | `ServersTransportTCP` |
+| `udp.routers` / `udp.services` | `IngressRouteUDP` plus `Service` + `EndpointSlice` |
+| `tls.options` | `TLSOption`, with `clientAuth.caFiles` moved to a `Secret` (`<option>-client-ca`, key `ca.crt`) |
+
+### How backends are represented
+
+Traefik's CRDs cannot carry a server list: an IngressRoute or TraefikService
+can only reference Kubernetes Services. For every Pangolin service the
+controller therefore creates headless, selectorless Services named
+`pkc-<service>[-<n>]` whose EndpointSlices hold the backend addresses
+(IPv4, IPv6 or hostnames). Two details of Traefik's resolver shape these:
+
+- Traefik matches EndpointSlice ports to the Service port by **name**, so every
+  generated port is named (`web`, `tcp` or `udp`).
+- Traefik de-duplicates endpoints by **address only**. Two targets on the same
+  Newt site share the site address and differ only by port, so they are placed
+  in separate Services and combined with weights.
+
+A server that is already a Service in `TARGET_NAMESPACE`
+(`http://<name>.<ns>.svc...`) is referenced directly. Load-balancer options
+(`sticky`, `strategy`, `passHostHeader`, `serversTransport`) are copied onto
+each Service reference. Active `healthCheck`s are dropped: Traefik only
+supports them for ExternalName Services.
+
+References to another Traefik provider (`noop@internal`, `crowdsec@file`) are
+passed through unchanged.
+
+The controller never takes over a Service it did not create: if a Service with
+a generated name exists without the managed annotation, the reconcile fails
+with an error instead.
 
 ---
 
@@ -166,6 +200,7 @@ Core behavior
 - CONFIG_ENDPOINT (string, required): Pangolin config API URL
 - READ_ONLY (bool, default=false): Dry-run mode (no mutations)
 - POLL_INTERVAL (duration, default=15s): Base polling/backoff interval
+- RESYNC_INTERVAL (duration, default=10m): Re-apply the full config even when Pangolin reports no change, repairing objects that were edited or deleted by hand. `0` disables it.
 - MAX_BACKOFF (duration, default=2m): Maximum backoff wait
 - TARGET_NAMESPACE (string, default=pangolin): Namespace to manage Traefik CRDs
 - ON_LOSE (string, default=exit): Behavior on leadership loss: exit | pause
@@ -198,6 +233,7 @@ Traefik specifics
 - INGRESS_CLASS_LABEL_VERIFY_INTERVAL (duration, default=3h): Periodic verification of the selected IngressClass having the instance label
 - INGRESS_CLASS_LABEL_STRICT (bool, default=false): If true, a verification mismatch is fatal (CrashLoop)
 - CONFIG_FILE (string, optional): Path to YAML/JSON with the same fields; precedence is ENV > file > defaults
+- INGRESS_CLASS (string, default=traefik): Written as the `kubernetes.io/ingress.class` annotation on IngressRoute, IngressRouteTCP and IngressRouteUDP so a Traefik with `providers.kubernetesCRD.ingressClass` set picks them up
 - TRAEFIK_LB_URL (string): Full URL used to fill empty TraefikService specs
 - TRAEFIK_LB_IP (string), TRAEFIK_LB_SCHEME (default=http), TRAEFIK_LB_PORT (string): Alternative for building the URL
 
@@ -388,9 +424,9 @@ Notes:
 ## **Apply / Server-Side Apply (SSA)**
 
 - Build [unstructured.Unstructured](https://pkg.go.dev/k8s.io/apimachinery/pkg/apis/meta/v1/unstructured) object with `apiVersion`, `kind`, metadata, spec.
-- Use [SSA](https://kubernetes.io/docs/reference/using-api/server-side-apply/) (`types.ApplyPatchType`), set stable `FieldManager: "pangolin-kube-controller"`.
-- On NotFound: create; On Conflict: re-fetch and retry.
-- Use `force` only to recover from severe field ownership conflicts (with audit/documentation).
+- Every object, including new ones, is written with [SSA](https://kubernetes.io/docs/reference/using-api/server-side-apply/) (`types.ApplyPatchType`) under the stable `FieldManager: "pangolin-kube-controller"` with `force: true`. The controller is the only writer of the objects it manages, and a plain Create would leave fields owned by an `Update` manager that later applies cannot remove.
+- Objects created by 0.1.0-alpha.1 (managers `controller` / `pangolin-kube-controller` with operation `Update`) are migrated to the apply manager with `csaupgrade` before the first apply.
+- Services, EndpointSlices and Secrets are applied first, then the Traefik CRDs, so a route never references a backend that does not exist yet.
 
 Example apply function:
 
@@ -420,6 +456,8 @@ For each resource kind:
 3. For each existing object not in desired set: delete (or log if `READ_ONLY=true`) and increment `pangolin_kube_controller_objects_deleted_total{kind=...}`.
 4. Perform apply loop (create/update) **before** GC to avoid downtime on renames: apply -> GC.
 5. Process items deterministically (sort by name) to ensure stable behavior and logs.
+6. Services, EndpointSlices and Secrets are collected once per reconcile across HTTP, TCP and UDP, so one protocol never deletes another's backends.
+7. A Pangolin entry that cannot be converted is logged and skipped. Its existing object is kept, and Service/EndpointSlice/Secret GC is skipped for that reconcile, so one malformed entry never takes down routes that currently work.
 
 ### GC grace period and events
 
@@ -604,7 +642,13 @@ metadata:
   name: pangolin-kube-controller
 rules:
   - apiGroups: ["traefik.io"]
-    resources: ["ingressroutes", "middlewares", "traefikservices"]
+    resources: ["ingressroutes", "ingressroutetcps", "ingressrouteudps", "middlewares", "traefikservices", "serverstransports", "serverstransporttcps", "tlsoptions"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["services", "secrets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   - apiGroups: ["networking.k8s.io"]
     resources: ["ingressclasses"]

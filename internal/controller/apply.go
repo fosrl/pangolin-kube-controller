@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	stderrors "errors"
 	"fmt"
+	"sort"
 	"time"
 
 	logrus "github.com/sirupsen/logrus"
@@ -16,6 +17,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
 
 	"pangolin-kube-controller/internal/apply"
@@ -29,6 +31,42 @@ import (
 	"go.opentelemetry.io/otel/metric"
 )
 
+// crdSet is the desired state of one Traefik CRD kind. Spec-only kinds fill
+// specs; route kinds, whose objects are built whole, fill objects. keep holds
+// names whose conversion failed: their existing objects stay in place instead
+// of being garbage-collected, so one malformed Pangolin entry does not take
+// down a route that currently works.
+type crdSet struct {
+	kind    string
+	gvr     schema.GroupVersionResource
+	specs   map[string]json.RawMessage
+	objects map[string]map[string]interface{}
+	keep    map[string]struct{}
+}
+
+func (s *crdSet) names() map[string]json.RawMessage {
+	out := make(map[string]json.RawMessage, len(s.specs)+len(s.objects)+len(s.keep))
+	for n := range s.specs {
+		out[n] = nil
+	}
+	for n := range s.objects {
+		out[n] = nil
+	}
+	for n := range s.keep {
+		out[n] = nil
+	}
+	return out
+}
+
+// desiredState is everything one Pangolin config maps to.
+type desiredState struct {
+	crds     []*crdSet
+	services []*corev1.Service
+	slices   []*discoveryv1.EndpointSlice
+	secrets  []*corev1.Secret
+	failures []error
+}
+
 func (c *Controller) applyConfig(ctx context.Context, cfg *traefikconfig.Config) error {
 	sanitizedCfg, err := sanitize.SanitizeTraefikConfig(cfg)
 	if err != nil {
@@ -37,125 +75,65 @@ func (c *Controller) applyConfig(ctx context.Context, cfg *traefikconfig.Config)
 	if sanitizedCfg == nil {
 		return nil
 	}
-	if !c.cfg.ReconcileParallel {
-		return c.applyConfigSequential(ctx, sanitizedCfg)
+	ds := c.buildDesired(sanitizedCfg)
+	for _, f := range ds.failures {
+		logrus.Warnf("Skipping Pangolin entry that cannot be converted (existing objects are kept): %v", f)
 	}
-	return c.applyConfigParallel(ctx, sanitizedCfg)
-}
 
-func (c *Controller) applyConfigSequential(ctx context.Context, sanitizedCfg *traefikconfig.Config) error {
-	phase := func(name string, fn func(context.Context) error) error {
-		start := time.Now()
-		err := fn(ctx)
-		if c.collector != nil && c.collector.OTel != nil {
-			res := "success"
-			if err != nil {
-				res = "error"
-			}
-			c.collector.OTel.ReconcilePhaseDuration.Record(ctx, time.Since(start).Seconds(),
-				metric.WithAttributes(
-					metrics_otel.AttrPhase.String(name),
-					metrics_otel.AttrResult.String(res),
-				),
-			)
-		}
+	if err := c.timedPhase(ctx, "backends", func(ctx context.Context) error { return c.applyCoreObjects(ctx, ds) }); err != nil {
+		return fmt.Errorf("backends reconcile failed: %w", err)
+	}
+	if err := c.reconcileCRDs(ctx, ds.crds); err != nil {
 		return err
 	}
-	if err := phase("middlewares", func(ctx context.Context) error {
-		return c.reconcileMiddlewares(ctx, c.dyn, c.gvrMiddleware, sanitizedCfg.HTTP.Middlewares)
-	}); err != nil {
-		return fmt.Errorf("middleware reconcile failed: %w", err)
+	if len(ds.failures) > 0 {
+		logrus.Warnf("Skipping garbage collection of Services, EndpointSlices and Secrets: %d entries failed to convert", len(ds.failures))
+		return nil
 	}
-	if err := phase("routers", func(ctx context.Context) error {
-		return c.reconcileRouters(ctx, c.dyn, c.gvrIngressRoute, sanitizedCfg.HTTP.Routers)
-	}); err != nil {
-		return fmt.Errorf("routers reconcile failed: %w", err)
-	}
-	if err := phase("serversTransports", func(ctx context.Context) error {
-		return c.reconcileServersTransports(ctx, c.dyn, c.gvrServersTransport, sanitizedCfg.HTTP.ServersTransports)
-	}); err != nil {
-		return fmt.Errorf("serversTransports reconcile failed: %w", err)
-	}
-	if err := phase("services", func(ctx context.Context) error {
-		return c.reconcileServices(ctx, c.dyn, c.gvrTraefikService, sanitizedCfg.HTTP.Services)
-	}); err != nil {
-		return fmt.Errorf("services reconcile failed: %w", err)
-	}
-	if err := phase("tcp", func(ctx context.Context) error { return c.reconcileTCP(ctx, sanitizedCfg) }); err != nil {
-		return fmt.Errorf("tcp reconcile failed: %w", err)
-	}
-	if err := phase("udp", func(ctx context.Context) error { return c.reconcileUDP(ctx, sanitizedCfg) }); err != nil {
-		return fmt.Errorf("udp reconcile failed: %w", err)
+	if err := c.timedPhase(ctx, "backends-gc", func(ctx context.Context) error { return c.gcCoreObjects(ctx, ds) }); err != nil {
+		return fmt.Errorf("backends garbage collection failed: %w", err)
 	}
 	return nil
 }
 
-func (c *Controller) applyConfigParallel(ctx context.Context, sanitizedCfg *traefikconfig.Config) error {
-	concurrency := c.cfg.ReconcileMax
-	if concurrency < 1 {
-		concurrency = 1
+// buildDesired converts the sanitized config into Kubernetes objects. It does
+// not touch the cluster.
+func (c *Controller) buildDesired(cfg *traefikconfig.Config) *desiredState {
+	ns := c.cfg.Namespace
+	ds := &desiredState{}
+	newSet := func(kind string, gvr schema.GroupVersionResource) *crdSet {
+		s := &crdSet{kind: kind, gvr: gvr, specs: map[string]json.RawMessage{}, objects: map[string]map[string]interface{}{}, keep: map[string]struct{}{}}
+		ds.crds = append(ds.crds, s)
+		return s
 	}
-	sem := make(chan struct{}, concurrency)
-	g, gctx := errgroup.WithContext(ctx)
-	wrapPhase := func(phase string, f func(context.Context) error) func() error {
-		return func() error {
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			if c.collector != nil && c.collector.OTel != nil {
-				c.collector.OTel.ActiveReconcileRoutines.Add(gctx, 1, metric.WithAttributes(metrics_otel.AttrPhase.String(phase)))
-				defer c.collector.OTel.ActiveReconcileRoutines.Add(gctx, -1, metric.WithAttributes(metrics_otel.AttrPhase.String(phase)))
-			}
-			start := time.Now()
-			err := f(gctx)
-			if c.collector != nil && c.collector.OTel != nil {
-				res := "success"
-				if err != nil {
-					res = "error"
-				}
-				c.collector.OTel.ReconcilePhaseDuration.Record(gctx, time.Since(start).Seconds(),
-					metric.WithAttributes(
-						metrics_otel.AttrPhase.String(phase),
-						metrics_otel.AttrResult.String(res),
-					),
-				)
-			}
-			return err
+	fail := func(set *crdSet, failed map[string]error) {
+		for _, name := range sortedNames(failed) {
+			set.keep[name] = struct{}{}
+			ds.failures = append(ds.failures, failed[name])
 		}
 	}
-	g.Go(wrapPhase("middlewares", func(ctx context.Context) error {
-		return c.reconcileMiddlewares(ctx, c.dyn, c.gvrMiddleware, sanitizedCfg.HTTP.Middlewares)
-	}))
-	g.Go(wrapPhase("routers", func(ctx context.Context) error {
-		return c.reconcileRouters(ctx, c.dyn, c.gvrIngressRoute, sanitizedCfg.HTTP.Routers)
-	}))
-	g.Go(wrapPhase("serversTransports", func(ctx context.Context) error {
-		return c.reconcileServersTransports(ctx, c.dyn, c.gvrServersTransport, sanitizedCfg.HTTP.ServersTransports)
-	}))
-	g.Go(wrapPhase("services", func(ctx context.Context) error {
-		return c.reconcileServices(ctx, c.dyn, c.gvrTraefikService, sanitizedCfg.HTTP.Services)
-	}))
-	g.Go(wrapPhase("tcp", func(ctx context.Context) error { return c.reconcileTCP(ctx, sanitizedCfg) }))
-	g.Go(wrapPhase("udp", func(ctx context.Context) error { return c.reconcileUDP(ctx, sanitizedCfg) }))
-	if err := g.Wait(); err != nil {
-		return err
-	}
-	return nil
-}
 
-func (c *Controller) reconcileMiddlewares(ctx context.Context, dyn dynamic.Interface, gvr schema.GroupVersionResource, middlewares map[string]json.RawMessage) error {
-	if err := c.applyDesiredObjects(ctx, dyn, gvr, middlewares); err != nil {
-		return err
+	middlewares := newSet("Middleware", c.gvrMiddleware)
+	for n, raw := range cfg.HTTP.Middlewares {
+		middlewares.specs[n] = raw
 	}
-	return c.gcStaleObjects(ctx, dyn, gvr, middlewares, "Middleware")
-}
+	transports := newSet("ServersTransport", c.gvrServersTransport)
+	for n, raw := range cfg.HTTP.ServersTransports {
+		transports.specs[n] = raw
+	}
 
-func (c *Controller) reconcileRouters(ctx context.Context, dyn dynamic.Interface, gvr schema.GroupVersionResource, routers map[string]json.RawMessage) error {
-	resIfc := resources.AdaptResource(dyn.Resource(gvr).Namespace(c.cfg.Namespace))
-	transformed := make(map[string]map[string]interface{}, len(routers))
-	var transformErrors []error
-	for name, raw := range routers {
+	httpArt := protocol.TransformHTTPServices(c.cfg, ns, cfg.HTTP.Services)
+	traefikServices := newSet("TraefikService", c.gvrTraefikService)
+	traefikServices.specs = httpArt.TraefikServices
+	fail(traefikServices, httpArt.Failed)
+	ds.services = append(ds.services, httpArt.Services...)
+	ds.slices = append(ds.slices, httpArt.Slices...)
+
+	routes := newSet("IngressRoute", c.gvrIngressRoute)
+	routeErrs := map[string]error{}
+	for name, raw := range cfg.HTTP.Routers {
 		u, err := routing.TransformRouterToIngressRoute(name, raw, routing.RouterConfig{
-			Namespace:         c.cfg.Namespace,
+			Namespace:         ns,
 			ManagedLabelKey:   c.cfg.ManagedLabelKey,
 			ManagedLabelValue: c.cfg.ManagedLabelValue,
 			ManagedAnnoKey:    c.cfg.ManagedAnnoKey,
@@ -163,41 +141,178 @@ func (c *Controller) reconcileRouters(ctx context.Context, dyn dynamic.Interface
 			IngressClass:      c.cfg.IngressClass,
 		})
 		if err != nil {
-			transformErrors = append(transformErrors, fmt.Errorf("router %s: %w", name, err))
+			routeErrs[name] = fmt.Errorf("router %s: %w", name, err)
 			continue
 		}
-		transformed[name] = u
+		routes.objects[name] = u
 	}
-	if len(transformErrors) > 0 {
-		return stderrors.Join(transformErrors...)
+	fail(routes, routeErrs)
+
+	tcp := protocol.TransformTCP(cfg, ns)
+	tcpTransports := newSet("ServersTransportTCP", c.gvrServersTransportTCP)
+	tcpTransports.specs = tcp.Transports
+	tcpRoutes := newSet("IngressRouteTCP", c.gvrIngressRouteTCP)
+	tcpRoutes.objects = tcp.Routes
+	fail(tcpRoutes, tcp.Failed)
+	ds.services = append(ds.services, tcp.Services...)
+	ds.slices = append(ds.slices, tcp.Slices...)
+
+	udp := protocol.TransformUDP(cfg, ns)
+	udpRoutes := newSet("IngressRouteUDP", c.gvrIngressRouteUDP)
+	udpRoutes.objects = udp.Routes
+	fail(udpRoutes, udp.Failed)
+	ds.services = append(ds.services, udp.Services...)
+	ds.slices = append(ds.slices, udp.Slices...)
+
+	var tlsOptions map[string]json.RawMessage
+	if cfg.TLS != nil {
+		tlsOptions = cfg.TLS.Options
 	}
-	for name, u := range transformed {
-		if err := c.applyIngressRoute(ctx, resIfc, name, u); err != nil {
-			return err
+	tls := protocol.TransformTLSOptions(ns, tlsOptions)
+	tlsSet := newSet("TLSOption", c.gvrTLSOption)
+	tlsSet.specs = tls.Options
+	fail(tlsSet, tls.Failed)
+	ds.secrets = tls.Secrets
+
+	for _, s := range ds.crds {
+		if s.specs == nil {
+			s.specs = map[string]json.RawMessage{}
+		}
+		if s.objects == nil {
+			s.objects = map[string]map[string]interface{}{}
 		}
 	}
-	err := c.gcStaleObjects(ctx, dyn, gvr, routers, "IngressRoute")
-	if err != nil {
-		return err
-	}
-	return nil
+	return ds
 }
 
-func (c *Controller) applyIngressRoute(ctx context.Context, resIfc resources.ResourceClient, name string, u map[string]interface{}) error {
+func sortedNames(m map[string]error) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func (c *Controller) timedPhase(ctx context.Context, name string, fn func(context.Context) error) error {
+	start := time.Now()
+	err := fn(ctx)
+	if c.collector != nil && c.collector.OTel != nil {
+		res := "success"
+		if err != nil {
+			res = "error"
+		}
+		c.collector.OTel.ReconcilePhaseDuration.Record(ctx, time.Since(start).Seconds(),
+			metric.WithAttributes(
+				metrics_otel.AttrPhase.String(name),
+				metrics_otel.AttrResult.String(res),
+			),
+		)
+	}
+	return err
+}
+
+// reconcileCRDs applies and garbage-collects every Traefik CRD kind, one
+// phase per kind, sequentially or with bounded parallelism.
+func (c *Controller) reconcileCRDs(ctx context.Context, sets []*crdSet) error {
+	if !c.cfg.ReconcileParallel {
+		var errs []error
+		for _, s := range sets {
+			if err := c.timedPhase(ctx, s.kind, func(ctx context.Context) error { return c.reconcileSet(ctx, s) }); err != nil {
+				errs = append(errs, fmt.Errorf("%s reconcile failed: %w", s.kind, err))
+			}
+		}
+		return stderrors.Join(errs...)
+	}
+	concurrency := c.cfg.ReconcileMax
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	// A failing kind must not cancel the others, so errors are collected
+	// rather than propagated through a shared context.
+	var g errgroup.Group
+	g.SetLimit(concurrency)
+	errs := make([]error, len(sets))
+	for i, s := range sets {
+		g.Go(func() error {
+			if c.collector != nil && c.collector.OTel != nil {
+				c.collector.OTel.ActiveReconcileRoutines.Add(ctx, 1, metric.WithAttributes(metrics_otel.AttrPhase.String(s.kind)))
+				defer c.collector.OTel.ActiveReconcileRoutines.Add(ctx, -1, metric.WithAttributes(metrics_otel.AttrPhase.String(s.kind)))
+			}
+			if err := c.timedPhase(ctx, s.kind, func(ctx context.Context) error { return c.reconcileSet(ctx, s) }); err != nil {
+				errs[i] = fmt.Errorf("%s reconcile failed: %w", s.kind, err)
+			}
+			return nil
+		})
+	}
+	_ = g.Wait()
+	return stderrors.Join(errs...)
+}
+
+func (c *Controller) reconcileSet(ctx context.Context, s *crdSet) error {
+	var errs []error
+	if len(s.specs) > 0 {
+		errs = append(errs, c.applyDesiredObjects(ctx, c.dyn, s.gvr, s.specs))
+	}
+	if len(s.objects) > 0 {
+		errs = append(errs, c.applyRouteObjects(ctx, s))
+	}
+	// Objects that failed to apply are still desired, so GC leaves them alone.
+	errs = append(errs, c.gcStaleObjects(ctx, c.dyn, s.gvr, s.names(), s.kind))
+	return stderrors.Join(errs...)
+}
+
+func (c *Controller) metaConfig() apply.MetadataConfig {
+	return apply.MetadataConfig{
+		ManagedLabelKey:           c.cfg.ManagedLabelKey,
+		ManagedLabelValue:         c.cfg.ManagedLabelValue,
+		TraefikInstanceLabelKey:   c.cfg.TraefikInstanceLabelKey,
+		TraefikInstanceLabelValue: c.cfg.TraefikInstanceLabelValue,
+		ManagedAnnoKey:            c.cfg.ManagedAnnoKey,
+		ManagedAnnoValue:          c.cfg.ManagedAnnoValue,
+		IngressClass:              c.cfg.IngressClass,
+	}
+}
+
+func (c *Controller) applyRouteObjects(ctx context.Context, s *crdSet) error {
 	if c.cfg.ReadOnly {
 		return nil
 	}
+	resIfc := resources.AdaptResource(c.dyn.Resource(s.gvr).Namespace(c.cfg.Namespace))
 	ops := &apply.IngressRouteOps{
-		ResIfc:            resIfc,
-		Namespace:         c.cfg.Namespace,
-		ManagedLabelKey:   c.cfg.ManagedLabelKey,
-		ManagedLabelValue: c.cfg.ManagedLabelValue,
-		ManagedAnnoKey:    c.cfg.ManagedAnnoKey,
-		ManagedAnnoValue:  c.cfg.ManagedAnnoValue,
-		IngressClass:      c.cfg.IngressClass,
-		ReadOnly:          c.cfg.ReadOnly,
+		ResIfc:                    resIfc,
+		Namespace:                 c.cfg.Namespace,
+		ManagedLabelKey:           c.cfg.ManagedLabelKey,
+		ManagedLabelValue:         c.cfg.ManagedLabelValue,
+		ManagedAnnoKey:            c.cfg.ManagedAnnoKey,
+		ManagedAnnoValue:          c.cfg.ManagedAnnoValue,
+		IngressClass:              c.cfg.IngressClass,
+		ReadOnly:                  c.cfg.ReadOnly,
+		TraefikInstanceLabelKey:   c.cfg.TraefikInstanceLabelKey,
+		TraefikInstanceLabelValue: c.cfg.TraefikInstanceLabelValue,
 	}
-	return ops.Apply(ctx, name, u)
+	names := make([]string, 0, len(s.objects))
+	for n := range s.objects {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	// One object the API server rejects (for example a load-balancing strategy
+	// an older Traefik CRD does not know) must not block the others.
+	var errs []error
+	for _, name := range names {
+		u := s.objects[name]
+		meta, _ := u["metadata"].(map[string]interface{})
+		if meta == nil {
+			meta = map[string]interface{}{}
+			u["metadata"] = meta
+		}
+		meta["name"] = name
+		meta["namespace"] = c.cfg.Namespace
+		if err := ops.ApplySingle(ctx, u, s.kind); err != nil {
+			errs = append(errs, fmt.Errorf("%s %s: %w", s.kind, name, err))
+		}
+	}
+	return stderrors.Join(errs...)
 }
 
 func (c *Controller) applyDesiredObjects(ctx context.Context, dyn dynamic.Interface, gvr schema.GroupVersionResource, objects map[string]json.RawMessage) error {
@@ -210,24 +325,24 @@ func (c *Controller) applyDesiredObjects(ctx context.Context, dyn dynamic.Interf
 		Namespace: c.cfg.Namespace,
 		SSAForce:  c.cfg.SSAForce,
 	}
-	metaCfg := apply.MetadataConfig{
-		ManagedLabelKey:   c.cfg.ManagedLabelKey,
-		ManagedLabelValue: c.cfg.ManagedLabelValue,
-		ManagedAnnoKey:    c.cfg.ManagedAnnoKey,
-		ManagedAnnoValue:  c.cfg.ManagedAnnoValue,
-		IngressClass:      c.cfg.IngressClass,
+	metaCfg := c.metaConfig()
+	names := make([]string, 0, len(objects))
+	for n := range objects {
+		names = append(names, n)
 	}
-	for name := range objects {
+	sort.Strings(names)
+	var errs []error
+	for _, name := range names {
 		if err := ops.Apply(ctx, name, objects[name], metaCfg); err != nil {
-			return err
+			errs = append(errs, fmt.Errorf("%s %s: %w", apply.KindFor(gvr.Resource), name, err))
 		}
 	}
-	return nil
+	return stderrors.Join(errs...)
 }
 
 func (c *Controller) gcStaleObjects(ctx context.Context, dyn dynamic.Interface, gvr schema.GroupVersionResource, desiredObjs map[string]json.RawMessage, kind string) error {
 	resIfc := resources.AdaptResource(dyn.Resource(gvr).Namespace(c.cfg.Namespace))
-	existing, err := resIfc.List(ctx, metav1.ListOptions{LabelSelector: fmt.Sprintf("%s=%s", c.cfg.ManagedLabelKey, c.cfg.ManagedLabelValue)})
+	existing, err := resIfc.List(ctx, metav1.ListOptions{LabelSelector: c.managedSelector()})
 	if err != nil {
 		return err
 	}
@@ -247,8 +362,13 @@ func (c *Controller) gcStaleObjects(ctx context.Context, dyn dynamic.Interface, 
 		if err := deleteImmediate(ctx, resIfc, name); err != nil {
 			return err
 		}
+		logrus.Infof("Deleted stale %s %s", kind, name)
 	}
 	return nil
+}
+
+func (c *Controller) managedSelector() string {
+	return fmt.Sprintf("%s=%s", c.cfg.ManagedLabelKey, c.cfg.ManagedLabelValue)
 }
 
 func buildDesiredSet(objects map[string]json.RawMessage) map[string]struct{} {
@@ -285,281 +405,162 @@ func deleteImmediate(ctx context.Context, resIfc resources.ResourceClient, name 
 	return nil
 }
 
-func (c *Controller) reconcileServices(ctx context.Context, dyn dynamic.Interface, gvr schema.GroupVersionResource, services map[string]json.RawMessage) error {
-	processed := protocol.ProcessServices(c.cfg, services)
-	if err := c.applyDesiredObjects(ctx, dyn, gvr, processed); err != nil {
-		return err
-	}
-	return c.gcStaleObjects(ctx, dyn, gvr, processed, "TraefikService")
-}
+// ---------------------------------------------------------------------------
+// Core objects (Services, EndpointSlices, Secrets)
+// ---------------------------------------------------------------------------
 
-func (c *Controller) reconcileServersTransports(ctx context.Context, dyn dynamic.Interface, gvr schema.GroupVersionResource, transports map[string]json.RawMessage) error {
-	if transports == nil {
-		return nil
-	}
-	if err := c.applyDesiredObjects(ctx, dyn, gvr, transports); err != nil {
-		return err
-	}
-	return c.gcStaleObjects(ctx, dyn, gvr, transports, "ServersTransport")
-}
-
-func (c *Controller) reconcileTCP(ctx context.Context, cfg *traefikconfig.Config) error {
-	if cfg == nil || cfg.TCP == nil {
-		return nil
-	}
-	if err := c.reconcileServersTransportTCP(ctx, cfg.TCP.ServersTransports); err != nil {
-		return err
-	}
-	routes, svcs, slices, err := protocol.TransformTCP(cfg, c.cfg.Namespace)
-	if err != nil {
-		return err
-	}
-	if err := c.applyProtocolArtifacts(ctx, routes, svcs, slices, c.gvrIngressRouteTCP, "IngressRouteTCP"); err != nil {
-		return err
-	}
-	desiredSvc := make(map[string]json.RawMessage, len(svcs))
-	for _, svc := range svcs {
-		desiredSvc[svc.Name] = json.RawMessage("{}")
-	}
-	desiredSlices := make(map[string]json.RawMessage, len(slices))
-	for _, es := range slices {
-		desiredSlices[es.Name] = json.RawMessage("{}")
-	}
-	desiredRoutes := make(map[string]json.RawMessage, len(routes))
-	for _, r := range routes {
-		meta, _ := r["metadata"].(map[string]interface{})
-		if meta == nil {
-			continue
-		}
-		name, _ := meta["name"].(string)
-		if name != "" {
-			desiredRoutes[name] = json.RawMessage("{}")
-		}
-	}
-	if err := c.gcStaleObjects(ctx, c.dyn, c.gvrIngressRouteTCP, desiredRoutes, "IngressRouteTCP"); err != nil {
-		return err
-	}
-	if err := c.gcStaleCoreServices(ctx, desiredSvc); err != nil {
-		return err
-	}
-	if err := c.gcStaleEndpointSlices(ctx, desiredSlices); err != nil {
-		return err
-	}
-	return nil
-}
-
-func (c *Controller) reconcileUDP(ctx context.Context, cfg *traefikconfig.Config) error {
-	if cfg == nil || cfg.UDP == nil {
-		return nil
-	}
-	routes, svcs, slices, err := protocol.TransformUDP(cfg, c.cfg.Namespace)
-	if err != nil {
-		return err
-	}
-	if err := c.applyProtocolArtifacts(ctx, routes, svcs, slices, c.gvrIngressRouteUDP, "IngressRouteUDP"); err != nil {
-		return err
-	}
-	desiredSvc := make(map[string]json.RawMessage, len(svcs))
-	for _, svc := range svcs {
-		desiredSvc[svc.Name] = json.RawMessage("{}")
-	}
-	desiredSlices := make(map[string]json.RawMessage, len(slices))
-	for _, es := range slices {
-		desiredSlices[es.Name] = json.RawMessage("{}")
-	}
-	desiredRoutes := make(map[string]json.RawMessage, len(routes))
-	for _, r := range routes {
-		meta, _ := r["metadata"].(map[string]interface{})
-		if meta == nil {
-			continue
-		}
-		name, _ := meta["name"].(string)
-		if name != "" {
-			desiredRoutes[name] = json.RawMessage("{}")
-		}
-	}
-	if err := c.gcStaleObjects(ctx, c.dyn, c.gvrIngressRouteUDP, desiredRoutes, "IngressRouteUDP"); err != nil {
-		return err
-	}
-	if err := c.gcStaleCoreServices(ctx, desiredSvc); err != nil {
-		return err
-	}
-	if err := c.gcStaleEndpointSlices(ctx, desiredSlices); err != nil {
-		return err
-	}
-	return nil
-}
-
-func (c *Controller) reconcileServersTransportTCP(ctx context.Context, transports map[string]json.RawMessage) error {
-	if transports == nil {
-		return nil
-	}
-	st := make(map[string]json.RawMessage, len(transports))
-	for name, raw := range transports {
-		st[sanitize.SanitizeResourceName(name)] = raw
-	}
-	if err := c.applyDesiredObjects(ctx, c.dyn, c.gvrServersTransportTCP, st); err != nil {
-		return err
-	}
-	return c.gcStaleObjects(ctx, c.dyn, c.gvrServersTransportTCP, st, "ServersTransportTCP")
-}
-
-func (c *Controller) applyProtocolArtifacts(ctx context.Context, routes []map[string]interface{}, svcs []*corev1.Service, slices []*discoveryv1.EndpointSlice, ingressRouteGVR schema.GroupVersionResource, kind string) error {
-	if err := c.applyProtocolServices(ctx, svcs); err != nil {
-		return err
-	}
-	if err := c.applyProtocolSlices(ctx, slices); err != nil {
-		return err
-	}
-	return c.applyProtocolIngressRoutes(ctx, routes, ingressRouteGVR, kind)
-}
-
-func (c *Controller) applyProtocolServices(ctx context.Context, svcs []*corev1.Service) error {
-	for _, svc := range svcs {
-		if err := c.applyCoreService(ctx, svc); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (c *Controller) applyProtocolSlices(ctx context.Context, slices []*discoveryv1.EndpointSlice) error {
-	for _, es := range slices {
-		if err := c.applyEndpointSlice(ctx, es); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (c *Controller) applyProtocolIngressRoutes(ctx context.Context, routes []map[string]interface{}, ingressRouteGVR schema.GroupVersionResource, kind string) error {
-	resIfc := resources.AdaptResource(c.dyn.Resource(ingressRouteGVR).Namespace(c.cfg.Namespace))
-	ops := &apply.IngressRouteOps{
-		ResIfc:            resIfc,
-		Namespace:         c.cfg.Namespace,
-		ManagedLabelKey:   c.cfg.ManagedLabelKey,
-		ManagedLabelValue: c.cfg.ManagedLabelValue,
-		ManagedAnnoKey:    c.cfg.ManagedAnnoKey,
-		ManagedAnnoValue:  c.cfg.ManagedAnnoValue,
-		IngressClass:      c.cfg.IngressClass,
-		ReadOnly:          c.cfg.ReadOnly,
-	}
-	for _, m := range routes {
-		if err := ops.ApplySingle(ctx, m, kind); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (c *Controller) applyCoreService(ctx context.Context, svc *corev1.Service) error {
-	c.ensureManagedServiceMeta(svc)
+func (c *Controller) applyCoreObjects(ctx context.Context, ds *desiredState) error {
 	if c.cfg.ReadOnly {
 		return nil
 	}
-	cli := c.kube.CoreV1().Services(c.cfg.Namespace)
-	existing, err := cli.Get(ctx, svc.Name, metav1.GetOptions{})
-	if err != nil {
-		if errors.IsNotFound(err) {
-			_, err = cli.Create(ctx, svc, metav1.CreateOptions{})
+	for _, s := range ds.secrets {
+		c.markManaged(&s.ObjectMeta)
+		if err := c.applyCore(ctx, "Secret", s.Name, s, func(ctx context.Context) (metav1.Object, error) {
+			return c.kube.CoreV1().Secrets(c.cfg.Namespace).Get(ctx, s.Name, metav1.GetOptions{})
+		}, func(ctx context.Context, data []byte, opts metav1.PatchOptions) error {
+			_, err := c.kube.CoreV1().Secrets(c.cfg.Namespace).Patch(ctx, s.Name, types.ApplyPatchType, data, opts)
+			return err
+		}); err != nil {
 			return err
 		}
+	}
+	for _, svc := range ds.services {
+		c.markManaged(&svc.ObjectMeta)
+		if err := c.applyCore(ctx, "Service", svc.Name, svc, func(ctx context.Context) (metav1.Object, error) {
+			return c.kube.CoreV1().Services(c.cfg.Namespace).Get(ctx, svc.Name, metav1.GetOptions{})
+		}, func(ctx context.Context, data []byte, opts metav1.PatchOptions) error {
+			_, err := c.kube.CoreV1().Services(c.cfg.Namespace).Patch(ctx, svc.Name, types.ApplyPatchType, data, opts)
+			return err
+		}); err != nil {
+			return err
+		}
+	}
+	for _, es := range ds.slices {
+		c.markManaged(&es.ObjectMeta)
+		if err := c.applyCore(ctx, "EndpointSlice", es.Name, es, func(ctx context.Context) (metav1.Object, error) {
+			return c.kube.DiscoveryV1().EndpointSlices(c.cfg.Namespace).Get(ctx, es.Name, metav1.GetOptions{})
+		}, func(ctx context.Context, data []byte, opts metav1.PatchOptions) error {
+			_, err := c.kube.DiscoveryV1().EndpointSlices(c.cfg.Namespace).Patch(ctx, es.Name, types.ApplyPatchType, data, opts)
+			return err
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *Controller) markManaged(meta *metav1.ObjectMeta) {
+	meta.Namespace = c.cfg.Namespace
+	if meta.Labels == nil {
+		meta.Labels = map[string]string{}
+	}
+	meta.Labels[c.cfg.ManagedLabelKey] = c.cfg.ManagedLabelValue
+	if c.cfg.TraefikInstanceLabelKey != "" && c.cfg.TraefikInstanceLabelValue != "" {
+		meta.Labels[c.cfg.TraefikInstanceLabelKey] = c.cfg.TraefikInstanceLabelValue
+	}
+	if meta.Annotations == nil {
+		meta.Annotations = map[string]string{}
+	}
+	meta.Annotations[c.cfg.ManagedAnnoKey] = c.cfg.ManagedAnnoValue
+}
+
+// applyCore server-side applies one core object. An existing object of the
+// same name that the controller does not manage is never taken over.
+func (c *Controller) applyCore(ctx context.Context, kind, name string, obj interface{}, get func(context.Context) (metav1.Object, error), patch func(context.Context, []byte, metav1.PatchOptions) error) error {
+	existing, err := get(ctx)
+	switch {
+	case err == nil:
+		if existing.GetAnnotations()[c.cfg.ManagedAnnoKey] != c.cfg.ManagedAnnoValue {
+			return fmt.Errorf("%s %s/%s exists and is not managed by this controller; refusing to overwrite it", kind, c.cfg.Namespace, name)
+		}
+	case errors.IsNotFound(err):
+	default:
+		return fmt.Errorf("get %s %s: %w", kind, name, err)
+	}
+	data, err := json.Marshal(obj)
+	if err != nil {
 		return err
 	}
-	existing.Spec = svc.Spec
-	existing.Labels = svc.Labels
-	existing.Annotations = svc.Annotations
-	_, err = cli.Update(ctx, existing, metav1.UpdateOptions{})
-	return err
+	force := true
+	if err := patch(ctx, data, metav1.PatchOptions{FieldManager: apply.FieldManager, Force: &force}); err != nil {
+		return fmt.Errorf("apply %s %s: %w", kind, name, err)
+	}
+	logrus.Debugf("Applied %s %s via SSA", kind, name)
+	return nil
 }
 
-func (c *Controller) ensureManagedServiceMeta(svc *corev1.Service) {
-	if svc.Labels == nil {
-		svc.Labels = map[string]string{}
-	}
-	svc.Labels[c.cfg.ManagedLabelKey] = c.cfg.ManagedLabelValue
-	if c.cfg.TraefikInstanceLabelKey != "" && c.cfg.TraefikInstanceLabelValue != "" {
-		svc.Labels[c.cfg.TraefikInstanceLabelKey] = c.cfg.TraefikInstanceLabelValue
-	}
-	if svc.Annotations == nil {
-		svc.Annotations = map[string]string{}
-	}
-	svc.Annotations[c.cfg.ManagedAnnoKey] = c.cfg.ManagedAnnoValue
-}
-
-func (c *Controller) applyEndpointSlice(ctx context.Context, es *discoveryv1.EndpointSlice) error {
-	c.ensureManagedEndpointSliceMeta(es)
+func (c *Controller) gcCoreObjects(ctx context.Context, ds *desiredState) error {
 	if c.cfg.ReadOnly {
 		return nil
 	}
-	cli := c.kube.DiscoveryV1().EndpointSlices(c.cfg.Namespace)
-	existing, err := cli.Get(ctx, es.Name, metav1.GetOptions{})
-	if err != nil {
-		if errors.IsNotFound(err) {
-			_, err = cli.Create(ctx, es, metav1.CreateOptions{})
-			return err
-		}
-		return err
+	sel := metav1.ListOptions{LabelSelector: c.managedSelector()}
+	managed := func(m metav1.Object) bool { return m.GetAnnotations()[c.cfg.ManagedAnnoKey] == c.cfg.ManagedAnnoValue }
+	var errs []error
+
+	// Slices first, then Services, so Traefik never sees a Service whose
+	// slices still point at removed backends.
+	wantSlices := map[string]struct{}{}
+	for _, es := range ds.slices {
+		wantSlices[es.Name] = struct{}{}
 	}
-	existing.Endpoints = es.Endpoints
-	existing.Ports = es.Ports
-	existing.Labels = es.Labels
-	existing.Annotations = es.Annotations
-	_, err = cli.Update(ctx, existing, metav1.UpdateOptions{})
-	return err
+	sliceCli := c.kube.DiscoveryV1().EndpointSlices(c.cfg.Namespace)
+	if list, err := sliceCli.List(ctx, sel); err != nil {
+		errs = append(errs, err)
+	} else {
+		for i := range list.Items {
+			it := &list.Items[i]
+			if _, keep := wantSlices[it.Name]; keep || !managed(it) {
+				continue
+			}
+			if err := sliceCli.Delete(ctx, it.Name, metav1.DeleteOptions{}); err != nil && !errors.IsNotFound(err) {
+				errs = append(errs, err)
+			}
+		}
+	}
+
+	wantSvcs := map[string]struct{}{}
+	for _, s := range ds.services {
+		wantSvcs[s.Name] = struct{}{}
+	}
+	svcCli := c.kube.CoreV1().Services(c.cfg.Namespace)
+	if list, err := svcCli.List(ctx, sel); err != nil {
+		errs = append(errs, err)
+	} else {
+		for i := range list.Items {
+			it := &list.Items[i]
+			if _, keep := wantSvcs[it.Name]; keep || !managed(it) {
+				continue
+			}
+			if err := svcCli.Delete(ctx, it.Name, metav1.DeleteOptions{}); err != nil && !errors.IsNotFound(err) {
+				errs = append(errs, err)
+			}
+		}
+	}
+
+	wantSecrets := map[string]struct{}{}
+	for _, s := range ds.secrets {
+		wantSecrets[s.Name] = struct{}{}
+	}
+	secretCli := c.kube.CoreV1().Secrets(c.cfg.Namespace)
+	if list, err := secretCli.List(ctx, sel); err != nil {
+		errs = append(errs, err)
+	} else {
+		for i := range list.Items {
+			it := &list.Items[i]
+			if _, keep := wantSecrets[it.Name]; keep || !managed(it) {
+				continue
+			}
+			if err := secretCli.Delete(ctx, it.Name, metav1.DeleteOptions{}); err != nil && !errors.IsNotFound(err) {
+				errs = append(errs, err)
+			}
+		}
+	}
+	return stderrors.Join(errs...)
 }
 
-func (c *Controller) ensureManagedEndpointSliceMeta(es *discoveryv1.EndpointSlice) {
-	if es.Labels == nil {
-		es.Labels = map[string]string{}
-	}
-	es.Labels[c.cfg.ManagedLabelKey] = c.cfg.ManagedLabelValue
-	if c.cfg.TraefikInstanceLabelKey != "" && c.cfg.TraefikInstanceLabelValue != "" {
-		es.Labels[c.cfg.TraefikInstanceLabelKey] = c.cfg.TraefikInstanceLabelValue
-	}
-	if es.Annotations == nil {
-		es.Annotations = map[string]string{}
-	}
-	es.Annotations[c.cfg.ManagedAnnoKey] = c.cfg.ManagedAnnoValue
-}
-
-func (c *Controller) gcStaleCoreServices(ctx context.Context, desired map[string]json.RawMessage) error {
-	cli := c.kube.CoreV1().Services(c.cfg.Namespace)
-	list, err := cli.List(ctx, metav1.ListOptions{LabelSelector: fmt.Sprintf("%s=%s", c.cfg.ManagedLabelKey, c.cfg.ManagedLabelValue)})
-	if err != nil {
-		return err
-	}
-	for i := range list.Items {
-		svc := &list.Items[i]
-		name := svc.Name
-		if _, keep := desired[name]; keep || svc.Annotations[c.cfg.ManagedAnnoKey] != c.cfg.ManagedAnnoValue || c.cfg.ReadOnly {
-			continue
-		}
-		if err := cli.Delete(ctx, name, metav1.DeleteOptions{}); err != nil && !errors.IsNotFound(err) {
-			return err
-		}
-	}
-	return nil
-}
-
-func (c *Controller) gcStaleEndpointSlices(ctx context.Context, desired map[string]json.RawMessage) error {
-	cli := c.kube.DiscoveryV1().EndpointSlices(c.cfg.Namespace)
-	list, err := cli.List(ctx, metav1.ListOptions{LabelSelector: fmt.Sprintf("%s=%s", c.cfg.ManagedLabelKey, c.cfg.ManagedLabelValue)})
-	if err != nil {
-		return err
-	}
-	for i := range list.Items {
-		es := &list.Items[i]
-		name := es.Name
-		if _, keep := desired[name]; keep || es.Annotations[c.cfg.ManagedAnnoKey] != c.cfg.ManagedAnnoValue || c.cfg.ReadOnly {
-			continue
-		}
-		if err := cli.Delete(ctx, name, metav1.DeleteOptions{}); err != nil && !errors.IsNotFound(err) {
-			return err
-		}
-	}
-	return nil
-}
+// ---------------------------------------------------------------------------
+// Grace-period deletion
+// ---------------------------------------------------------------------------
 
 func (c *Controller) enqueueGraceDeletion(ctx context.Context, req graceDeleteReq) {
 	if c.graceDelQueue == nil {
@@ -642,6 +643,8 @@ func (c *Controller) gvrForKind(kind string) schema.GroupVersionResource {
 		return c.gvrIngressRouteUDP
 	case "ServersTransportTCP":
 		return c.gvrServersTransportTCP
+	case "TLSOption":
+		return c.gvrTLSOption
 	default:
 		return schema.GroupVersionResource{}
 	}

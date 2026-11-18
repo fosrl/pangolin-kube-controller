@@ -1,6 +1,10 @@
 package apply
 
 import (
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"pangolin-kube-controller/internal/testutil"
+
 	"context"
 	"encoding/json"
 	"testing"
@@ -25,6 +29,7 @@ func newTestUnstructuredOps(t *testing.T) (*UnstructuredOps, *fake.FakeDynamicCl
 		testGVR: "MiddlewareList",
 	}
 	dyn := fake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(), listKinds)
+	testutil.InstallApplyReactor(dyn)
 	ops := &UnstructuredOps{
 		Dyn:       dyn,
 		GVR:       testGVR,
@@ -91,10 +96,10 @@ func TestApplyUpdateExistingResourceTriesPatch(t *testing.T) {
 	// First apply – creates the resource.
 	require.NoError(t, ops.Apply(context.Background(), "reused-mw", raw, testMetadataConfig()))
 
-	// Second apply with changed spec – reaches the patch path.
-	// The fake client doesn't support SSA, so it may return an error.
-	// What matters is that Apply is called without panicking.
+	// Second apply with changed spec replaces the spec.
 	raw2 := json.RawMessage(`{"passHostHeader": false}`)
-	_ = ops.Apply(context.Background(), "reused-mw", raw2, testMetadataConfig())
-	// No assertion on the error – we just confirm no panic occurs.
+	require.NoError(t, ops.Apply(context.Background(), "reused-mw", raw2, testMetadataConfig()))
+	got, err := ops.Dyn.Resource(ops.GVR).Namespace(TestNS).Get(context.Background(), "reused-mw", metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Equal(t, false, got.Object["spec"].(map[string]interface{})["passHostHeader"])
 }

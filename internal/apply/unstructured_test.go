@@ -123,22 +123,9 @@ func TestCreateUnstructured(t *testing.T) {
 
 	err := CreateUnstructured(context.Background(), fakeClient, u, "IngressRoute")
 	require.NoError(t, err)
-	require.Equal(t, 1, fakeClient.createCount)
-}
-
-func TestCreateUnstructuredWithFieldValidation(t *testing.T) {
-	t.Parallel()
-
-	fakeClient := &fakeResourceClientForUnstructured{}
-	u := map[string]interface{}{
-		"apiVersion": TraefikAPIVersion,
-		"kind":       KindTraefikService,
-		"metadata":   map[string]interface{}{"name": TestName},
-	}
-
-	err := CreateUnstructured(context.Background(), fakeClient, u, "TraefikService")
-	require.NoError(t, err)
-	require.Equal(t, 1, fakeClient.createCount)
+	// Objects are created with server-side apply, never with Create.
+	require.Equal(t, 0, fakeClient.createCount)
+	require.Equal(t, 1, fakeClient.patchCount)
 }
 
 func TestPatchUnstructured(t *testing.T) {

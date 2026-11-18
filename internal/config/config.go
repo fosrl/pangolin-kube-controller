@@ -12,7 +12,11 @@ type CertificateSecretRef struct {
 }
 
 type Config struct {
-	PollInterval         time.Duration
+	PollInterval time.Duration
+	// ResyncInterval forces a full apply even when Pangolin's config is
+	// unchanged, repairing objects that were edited or deleted by hand.
+	// Zero disables it.
+	ResyncInterval       time.Duration
 	Endpoint             string
 	Namespace            string
 	MaxBackoff           time.Duration

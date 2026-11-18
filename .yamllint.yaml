@@ -2,6 +2,7 @@ extends: default
 
 ignore: |
   test/crds/traefik/**
+  test/testdata/crds/**
 
 rules:
   document-start: disable

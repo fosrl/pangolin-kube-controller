@@ -13,17 +13,17 @@ func GetMetadataMap(existing *unstructured.Unstructured, getter func(*unstructur
 	return nil
 }
 
+// UpdateMetadataField always writes key=desiredValue into target and reports
+// whether that differs from the existing object. The key must be present even
+// when unchanged: under server-side apply, leaving a field out of the applied
+// object tells the API server to remove it.
 func UpdateMetadataField(existing map[string]string, key, desiredValue string, target map[string]interface{}) bool {
+	target[key] = desiredValue
 	if existing == nil {
-		target[key] = desiredValue
 		return true
 	}
 	val, ok := existing[key]
-	if !ok || val != desiredValue {
-		target[key] = desiredValue
-		return true
-	}
-	return false
+	return !ok || val != desiredValue
 }
 
 type MetadataConfig struct {
@@ -75,7 +75,7 @@ func BuildMetadataForApply(existing *unstructured.Unstructured, name, ns, kind s
 		needForce = true
 	}
 
-	if kind == "IngressRoute" {
+	if IsRouteKind(kind) && cfg.IngressClass != "" {
 		if UpdateMetadataField(
 			existingAnnotations,
 			routing.IngressClassAnnotation,
@@ -132,4 +132,10 @@ func NeedsForceOnMapChange(existing map[string]string, desired map[string]interf
 		}
 	}
 	return false
+}
+
+// IsRouteKind reports whether kind is one of the Traefik route kinds the
+// ingress class annotation applies to.
+func IsRouteKind(kind string) bool {
+	return kind == "IngressRoute" || kind == "IngressRouteTCP" || kind == "IngressRouteUDP"
 }

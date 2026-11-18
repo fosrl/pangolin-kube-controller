@@ -147,11 +147,15 @@ func TestBuildMetadataForApplyUpdateSameValuesNoForce(t *testing.T) {
 	if force {
 		t.Error("force = true, want false when existing matches")
 	}
-	if _, hasLabels := meta["labels"]; hasLabels {
-		t.Error("meta should not have labels when unchanged")
+	// Unchanged values must still be sent: server-side apply removes fields
+	// the applier owns but leaves out.
+	labels, _ := meta["labels"].(map[string]interface{})
+	if labels[managedLabelKey] != managedLabelValue || labels[instanceLabelKey] != instanceLabelVal {
+		t.Errorf("labels = %v, want managed and instance labels", labels)
 	}
-	if _, hasAnnotations := meta["annotations"]; hasAnnotations {
-		t.Error("meta should not have annotations when unchanged")
+	annotations, _ := meta["annotations"].(map[string]interface{})
+	if annotations[managedAnnoKey] != managedAnnoValue {
+		t.Errorf("annotations = %v, want managed annotation", annotations)
 	}
 }
 

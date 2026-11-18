@@ -14,6 +14,7 @@ import (
 
 	"pangolin-kube-controller/internal/config"
 	prometheus "pangolin-kube-controller/internal/observability/metrics_prometheus"
+	applytest "pangolin-kube-controller/internal/testutil"
 	"pangolin-kube-controller/internal/transform/testutil"
 )
 
@@ -69,8 +70,10 @@ func newTestController(t *testing.T) *Controller {
 		{Group: testutil.TestTraefikGroup, Version: "v1alpha1", Resource: "ingressroutetcps"}:     "IngressRouteTCPList",
 		{Group: testutil.TestTraefikGroup, Version: "v1alpha1", Resource: "ingressrouteudps"}:     "IngressRouteUDPList",
 		{Group: testutil.TestTraefikGroup, Version: "v1alpha1", Resource: "serverstransporttcps"}: "ServersTransportTCPList",
+		{Group: testutil.TestTraefikGroup, Version: "v1alpha1", Resource: "tlsoptions"}:           "TLSOptionList",
 	}
 	dyn := fake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(), listKinds)
+	applytest.InstallApplyReactor(dyn)
 	kube := fakekube.NewClientset()
 	mc := prometheus.NewCollector()
 	cfg := &config.Config{

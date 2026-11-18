@@ -17,6 +17,14 @@ type Config struct {
 	HTTP HTTPConfig    `json:"http"`
 	TCP  *TCPUDPConfig `json:"tcp,omitempty"`
 	UDP  *TCPUDPConfig `json:"udp,omitempty"`
+	TLS  *TLSConfig    `json:"tls,omitempty"`
+}
+
+// TLSConfig contains the TLS options Pangolin defines (for example the
+// client-certificate requirements of mTLS resources). Stores and certificates
+// are not modelled: Pangolin does not emit them.
+type TLSConfig struct {
+	Options map[string]json.RawMessage `json:"options,omitempty"`
 }
 
 // HTTPConfig contains HTTP middlewares, routers, services, and transports.

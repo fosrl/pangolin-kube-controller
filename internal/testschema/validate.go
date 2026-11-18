@@ -4,7 +4,11 @@ import (
 	"fmt"
 	"strings"
 
+	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	structuralschema "k8s.io/apiextensions-apiserver/pkg/apiserver/schema"
+	"k8s.io/apiextensions-apiserver/pkg/apiserver/schema/pruning"
+	apiservervalidation "k8s.io/apiextensions-apiserver/pkg/apiserver/validation"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
@@ -25,8 +29,34 @@ func ValidatorFor(crd *apiextensionsv1.CustomResourceDefinition, version string)
 	}
 	group := crd.Spec.Group
 	kind := crd.Spec.Names.Kind
-	_ = vs // placeholder: schema unused in lightweight validation
-	return func(obj *unstructured.Unstructured) []error { return lightValidate(obj, group, kind, effectiveVersion) }, nil
+	internal := &apiextensions.JSONSchemaProps{}
+	if err := apiextensionsv1.Convert_v1_JSONSchemaProps_To_apiextensions_JSONSchemaProps(vs.OpenAPIV3Schema, internal, nil); err != nil {
+		return nil, fmt.Errorf("convert schema of %s: %w", crd.Name, err)
+	}
+	structural, err := structuralschema.NewStructural(internal)
+	if err != nil {
+		return nil, fmt.Errorf("structural schema of %s: %w", crd.Name, err)
+	}
+	validator, _, err := apiservervalidation.NewSchemaValidator(internal)
+	if err != nil {
+		return nil, fmt.Errorf("schema validator of %s: %w", crd.Name, err)
+	}
+	return func(obj *unstructured.Unstructured) []error {
+		errs := lightValidate(obj, group, kind, effectiveVersion)
+		if obj == nil {
+			return errs
+		}
+		// Fields the schema does not know are pruned silently by the API
+		// server, which is how an invalid spec used to look applied.
+		pruned := obj.DeepCopy().Object
+		for _, path := range pruning.PruneWithOptions(pruned, structural, true, structuralschema.UnknownFieldPathOptions{TrackUnknownFieldPaths: true}) {
+			errs = append(errs, fmt.Errorf("%s %s: unknown field %q", kind, obj.GetName(), path))
+		}
+		for _, fe := range apiservervalidation.ValidateCustomResource(nil, obj.Object, validator) {
+			errs = append(errs, fmt.Errorf("%s %s: %s", kind, obj.GetName(), fe.Error()))
+		}
+		return errs
+	}, nil
 }
 
 // resolveSchema picks the requested served version schema or falls back to the first available.

@@ -7,6 +7,7 @@ import (
 func newDefaults() *Config {
 	return &Config{
 		PollInterval:       envDuration("POLL_INTERVAL", 15*time.Second),
+		ResyncInterval:     envDuration("RESYNC_INTERVAL", 10*time.Minute),
 		Endpoint:           envString("CONFIG_ENDPOINT", "https://pangolin:3001/api/v1/traefik-config"),
 		Namespace:          envString("TARGET_NAMESPACE", "pangolin"),
 		MaxBackoff:         envDuration("MAX_BACKOFF", 2*time.Minute),

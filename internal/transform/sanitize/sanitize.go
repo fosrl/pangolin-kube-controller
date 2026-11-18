@@ -19,10 +19,23 @@ const (
 )
 
 type nameMappings struct {
-	middlewares map[string]string
-	services    map[string]string
-	transports  map[string]string
+	middlewares   map[string]string
+	services      map[string]string
+	transports    map[string]string
+	tcpServices   map[string]string
+	tcpTransports map[string]string
+	udpServices   map[string]string
+	tlsOptions    map[string]string
 }
+
+// ProviderSeparator separates a resource name from its provider in a Traefik
+// cross-provider reference such as "noop@internal" or "pp-transport-v1@file".
+const ProviderSeparator = "@"
+
+// IsCrossProviderRef reports whether name references an object of another
+// Traefik provider. Those names are resolved by Traefik itself and must reach
+// the CRD unchanged.
+func IsCrossProviderRef(name string) bool { return strings.Contains(name, ProviderSeparator) }
 
 func sortKeys[T any](m map[string]T) []string {
 	keys := make([]string, 0, len(m))
@@ -113,170 +126,194 @@ func finalizeSanitizedName(sanitized, original string) string {
 	return trimmed + "-" + suffix
 }
 
-// SanitizeTraefikConfig rewrites config names and references to Kubernetes-safe values.
+// SanitizeTraefikConfig rewrites config names and references to Kubernetes-safe
+// values. Every section the controller reconciles (HTTP, TCP, UDP and TLS
+// options) is carried over. References to objects of another Traefik provider
+// ("name@provider") are left untouched.
 func SanitizeTraefikConfig(cfg *traefikconfig.Config) (*traefikconfig.Config, error) {
 	if cfg == nil {
 		return nil, nil
 	}
-	sanitized := &traefikconfig.Config{
-		HTTP: traefikconfig.HTTPConfig{
-			Middlewares:       make(map[string]json.RawMessage, len(cfg.HTTP.Middlewares)),
-			Routers:           make(map[string]json.RawMessage, len(cfg.HTTP.Routers)),
-			Services:          make(map[string]json.RawMessage, len(cfg.HTTP.Services)),
-			ServersTransports: make(map[string]json.RawMessage, len(cfg.HTTP.ServersTransports)),
-		},
+	m := &nameMappings{
+		middlewares:   mapNames(cfg.HTTP.Middlewares),
+		services:      mapNames(cfg.HTTP.Services),
+		transports:    mapNames(cfg.HTTP.ServersTransports),
+		tcpServices:   map[string]string{},
+		tcpTransports: map[string]string{},
+		udpServices:   map[string]string{},
+		tlsOptions:    map[string]string{},
 	}
-	mappings := &nameMappings{
-		middlewares: make(map[string]string, len(cfg.HTTP.Middlewares)),
-		services:    make(map[string]string, len(cfg.HTTP.Services)),
-		transports:  make(map[string]string, len(cfg.HTTP.ServersTransports)),
+	if cfg.TCP != nil {
+		m.tcpServices = mapNames(cfg.TCP.Services)
+		m.tcpTransports = mapNames(cfg.TCP.ServersTransports)
 	}
-	// build mappings and populate sanitized config using small helpers
-	buildNameMappings(cfg, mappings)
-	if err := populateSanitizedMiddlewares(cfg, sanitized, mappings); err != nil {
+	if cfg.UDP != nil {
+		m.udpServices = mapNames(cfg.UDP.Services)
+	}
+	if cfg.TLS != nil {
+		m.tlsOptions = mapNames(cfg.TLS.Options)
+	}
+
+	out := &traefikconfig.Config{}
+	var err error
+	if out.HTTP.Middlewares, err = rewriteSection(cfg.HTTP.Middlewares, m.middlewares, "middleware", func(o map[string]interface{}) {
+		sanitizeMiddleware(o, m)
+	}); err != nil {
 		return nil, err
 	}
-	if err := populateSanitizedServices(cfg, sanitized, mappings); err != nil {
+	if out.HTTP.Services, err = rewriteSection(cfg.HTTP.Services, m.services, "service", func(o map[string]interface{}) {
+		sanitizeHTTPService(o, m)
+	}); err != nil {
 		return nil, err
 	}
-	populateSanitizedTransports(cfg, sanitized, mappings)
-	if err := populateSanitizedRouters(cfg, sanitized, mappings); err != nil {
+	if out.HTTP.ServersTransports, err = rewriteSection(cfg.HTTP.ServersTransports, m.transports, "serversTransport", nil); err != nil {
 		return nil, err
 	}
-	return sanitized, nil
-}
+	if out.HTTP.Routers, err = rewriteSection(cfg.HTTP.Routers, mapNames(cfg.HTTP.Routers), "router", func(o map[string]interface{}) {
+		sanitizeRouter(o, m.services, m.middlewares, m.tlsOptions)
+	}); err != nil {
+		return nil, err
+	}
 
-func buildNameMappings(cfg *traefikconfig.Config, mappings *nameMappings) {
-	for _, name := range sortKeys(cfg.HTTP.Middlewares) {
-		mappings.middlewares[name] = SanitizeResourceName(name)
-	}
-	for _, name := range sortKeys(cfg.HTTP.Services) {
-		mappings.services[name] = SanitizeResourceName(name)
-	}
-	for _, name := range sortKeys(cfg.HTTP.ServersTransports) {
-		mappings.transports[name] = SanitizeResourceName(name)
-	}
-}
-
-func populateSanitizedMiddlewares(cfg *traefikconfig.Config, sanitized *traefikconfig.Config, mappings *nameMappings) error {
-	for _, name := range sortKeys(cfg.HTTP.Middlewares) {
-		sanitizedName := mappings.middlewares[name]
-		sanitizedRaw, err := sanitizeMiddlewareRaw(cfg.HTTP.Middlewares[name], mappings)
-		if err != nil {
-			return fmt.Errorf("middleware %s sanitize: %w", name, err)
+	if cfg.TCP != nil {
+		out.TCP = &traefikconfig.TCPUDPConfig{}
+		if out.TCP.Services, err = rewriteSection(cfg.TCP.Services, m.tcpServices, "tcp service", func(o map[string]interface{}) {
+			rewriteLBTransport(o, m.tcpTransports)
+		}); err != nil {
+			return nil, err
 		}
-		sanitized.HTTP.Middlewares[sanitizedName] = sanitizedRaw
-	}
-	return nil
-}
-
-func populateSanitizedServices(cfg *traefikconfig.Config, sanitized *traefikconfig.Config, mappings *nameMappings) error {
-	for _, name := range sortKeys(cfg.HTTP.Services) {
-		sanitizedName := mappings.services[name]
-		sanitizedRaw, err := sanitizeServiceRaw(cfg.HTTP.Services[name], mappings)
-		if err != nil {
-			return fmt.Errorf("service %s sanitize: %w", name, err)
+		if out.TCP.ServersTransports, err = rewriteSection(cfg.TCP.ServersTransports, m.tcpTransports, "tcp serversTransport", nil); err != nil {
+			return nil, err
 		}
-		sanitized.HTTP.Services[sanitizedName] = sanitizedRaw
-	}
-	return nil
-}
-
-func populateSanitizedTransports(cfg *traefikconfig.Config, sanitized *traefikconfig.Config, mappings *nameMappings) {
-	for _, name := range sortKeys(cfg.HTTP.ServersTransports) {
-		sanitizedName := mappings.transports[name]
-		// serversTransport objects are pass-through specs
-		sanitized.HTTP.ServersTransports[sanitizedName] = cfg.HTTP.ServersTransports[name]
-	}
-}
-
-func populateSanitizedRouters(cfg *traefikconfig.Config, sanitized *traefikconfig.Config, mappings *nameMappings) error {
-	for _, name := range sortKeys(cfg.HTTP.Routers) {
-		sanitizedName := SanitizeResourceName(name)
-		sanitizedRaw, err := sanitizeRouterRaw(cfg.HTTP.Routers[name], mappings)
-		if err != nil {
-			return fmt.Errorf("router %s sanitize: %w", name, err)
+		if out.TCP.Routers, err = rewriteSection(cfg.TCP.Routers, mapNames(cfg.TCP.Routers), "tcp router", func(o map[string]interface{}) {
+			sanitizeRouter(o, m.tcpServices, nil, m.tlsOptions)
+		}); err != nil {
+			return nil, err
 		}
-		sanitized.HTTP.Routers[sanitizedName] = sanitizedRaw
 	}
-	return nil
+	if cfg.UDP != nil {
+		out.UDP = &traefikconfig.TCPUDPConfig{}
+		if out.UDP.Services, err = rewriteSection(cfg.UDP.Services, m.udpServices, "udp service", nil); err != nil {
+			return nil, err
+		}
+		if out.UDP.Routers, err = rewriteSection(cfg.UDP.Routers, mapNames(cfg.UDP.Routers), "udp router", func(o map[string]interface{}) {
+			sanitizeRouter(o, m.udpServices, nil, nil)
+		}); err != nil {
+			return nil, err
+		}
+	}
+	if cfg.TLS != nil {
+		out.TLS = &traefikconfig.TLSConfig{}
+		if out.TLS.Options, err = rewriteSection(cfg.TLS.Options, m.tlsOptions, "tls option", nil); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
 }
 
-func sanitizeRouterRaw(raw json.RawMessage, mappings *nameMappings) (json.RawMessage, error) {
-	if len(raw) == 0 {
-		return raw, nil
+func mapNames[T any](section map[string]T) map[string]string {
+	out := make(map[string]string, len(section))
+	for _, name := range sortKeys(section) {
+		out[name] = SanitizeResourceName(name)
 	}
-	var obj map[string]interface{}
-	if err := json.Unmarshal(raw, &obj); err != nil {
-		return nil, fmt.Errorf(errFmtUnmarshal, err)
+	return out
+}
+
+// rewriteSection renames every entry of a section and applies fix to its body.
+// Two source names that sanitize to the same Kubernetes name are an error:
+// silently keeping one would drop the other.
+func rewriteSection(section map[string]json.RawMessage, names map[string]string, what string, fix func(map[string]interface{})) (map[string]json.RawMessage, error) {
+	if section == nil {
+		return nil, nil
 	}
+	out := make(map[string]json.RawMessage, len(section))
+	owner := make(map[string]string, len(section))
+	for _, name := range sortKeys(section) {
+		newName := names[name]
+		if prev, dup := owner[newName]; dup {
+			return nil, fmt.Errorf("%s %q and %q both map to Kubernetes name %q", what, prev, name, newName)
+		}
+		owner[newName] = name
+		raw := section[name]
+		if fix != nil && len(raw) > 0 {
+			var obj map[string]interface{}
+			if err := json.Unmarshal(raw, &obj); err != nil {
+				return nil, fmt.Errorf("%s %s sanitize: "+errFmtUnmarshal, what, name, err)
+			}
+			if obj != nil {
+				fix(obj)
+			}
+			b, err := json.Marshal(obj)
+			if err != nil {
+				return nil, fmt.Errorf("%s %s sanitize: "+errFmtMarshal, what, name, err)
+			}
+			raw = b
+		}
+		out[newName] = raw
+	}
+	return out, nil
+}
+
+func sanitizeRouter(obj map[string]interface{}, services, middlewares, tlsOptions map[string]string) {
 	if svc, ok := obj["service"].(string); ok {
-		obj["service"] = sanitizeReference(svc, mappings.services)
+		obj["service"] = sanitizeReference(svc, services)
 	}
 	if mws, ok := obj["middlewares"].([]interface{}); ok {
 		for i, mw := range mws {
-			if mwName, ok := mw.(string); ok {
-				mws[i] = sanitizeReference(mwName, mappings.middlewares)
+			if name, ok := mw.(string); ok {
+				mws[i] = sanitizeReference(name, middlewares)
 			}
 		}
-		obj["middlewares"] = mws
 	}
-	b, err := json.Marshal(obj)
-	if err != nil {
-		return nil, fmt.Errorf(errFmtMarshal, err)
-	}
-	return json.RawMessage(b), nil
-}
-
-func sanitizeMiddlewareRaw(raw json.RawMessage, mappings *nameMappings) (json.RawMessage, error) {
-	if len(raw) == 0 {
-		return raw, nil
-	}
-	var obj map[string]interface{}
-	if err := json.Unmarshal(raw, &obj); err != nil {
-		return nil, fmt.Errorf(errFmtUnmarshal, err)
-	}
-	if chain, ok := obj["chain"].(map[string]interface{}); ok {
-		if mids, ok := chain["middlewares"].([]interface{}); ok {
-			for i, mw := range mids {
-				if name, ok := mw.(string); ok {
-					mids[i] = sanitizeReference(name, mappings.middlewares)
-				}
-			}
-			chain["middlewares"] = mids
+	if tls, ok := obj["tls"].(map[string]interface{}); ok {
+		if opt, ok := tls["options"].(string); ok && opt != "" {
+			tls["options"] = sanitizeReference(opt, tlsOptions)
 		}
-		obj["chain"] = chain
 	}
-	b, err := json.Marshal(obj)
-	if err != nil {
-		return nil, fmt.Errorf(errFmtMarshal, err)
-	}
-	return json.RawMessage(b), nil
 }
 
-func sanitizeServiceRaw(raw json.RawMessage, mappings *nameMappings) (json.RawMessage, error) {
-	if len(raw) == 0 {
-		return raw, nil
+// sanitizeMiddleware renames chain members and turns them into the
+// MiddlewareRef objects the Middleware CRD requires (the file provider uses
+// bare strings).
+func sanitizeMiddleware(obj map[string]interface{}, m *nameMappings) {
+	chain, ok := obj["chain"].(map[string]interface{})
+	if !ok {
+		return
 	}
-	var obj map[string]interface{}
-	if err := json.Unmarshal(raw, &obj); err != nil {
-		return nil, fmt.Errorf(errFmtUnmarshal, err)
+	mids, ok := chain["middlewares"].([]interface{})
+	if !ok {
+		return
 	}
-	sanitizeWeightedSection(obj, mappings)
-	sanitizeMirroringSection(obj, mappings)
-	sanitizeFailoverSection(obj, mappings)
-	// Rewrite loadBalancer.serversTransport to sanitized transport name
+	refs := make([]interface{}, 0, len(mids))
+	for _, mw := range mids {
+		switch v := mw.(type) {
+		case string:
+			refs = append(refs, map[string]interface{}{"name": sanitizeReference(v, m.middlewares)})
+		case map[string]interface{}:
+			if name, ok := v["name"].(string); ok {
+				v["name"] = sanitizeReference(name, m.middlewares)
+			}
+			refs = append(refs, v)
+		}
+	}
+	chain["middlewares"] = refs
+}
+
+func sanitizeHTTPService(obj map[string]interface{}, m *nameMappings) {
+	sanitizeWeightedSection(obj, m)
+	sanitizeMirroringSection(obj, m)
+	sanitizeFailoverSection(obj, m)
+	rewriteLBTransport(obj, m.transports)
+}
+
+// rewriteLBTransport rewrites loadBalancer.serversTransport to the sanitized
+// transport name.
+func rewriteLBTransport(obj map[string]interface{}, transports map[string]string) {
 	if lb, ok := obj["loadBalancer"].(map[string]interface{}); ok {
-		if st, ok2 := lb["serversTransport"].(string); ok2 {
-			lb["serversTransport"] = sanitizeReference(st, mappings.transports)
-			obj["loadBalancer"] = lb
+		if st, ok := lb["serversTransport"].(string); ok && st != "" {
+			lb["serversTransport"] = sanitizeReference(st, transports)
 		}
 	}
-	b, err := json.Marshal(obj)
-	if err != nil {
-		return nil, fmt.Errorf(errFmtMarshal, err)
-	}
-	return json.RawMessage(b), nil
 }
 
 // sanitizeWeightedSection rewrites service names in the weighted.services list.
@@ -290,9 +327,7 @@ func sanitizeWeightedSection(obj map[string]interface{}, mappings *nameMappings)
 					}
 				}
 			}
-			weighted["services"] = services
 		}
-		obj["weighted"] = weighted
 	}
 }
 
@@ -302,36 +337,18 @@ func sanitizeMirroringSection(obj map[string]interface{}, mappings *nameMappings
 	if !ok {
 		return
 	}
-	sanitizeMirroringPrimaryService(mirroring, mappings)
-	sanitizeMirroringMirrors(mirroring, mappings)
-	obj["mirroring"] = mirroring
-}
-
-func sanitizeMirroringPrimaryService(mirroring map[string]interface{}, mappings *nameMappings) {
-	service, ok := mirroring["service"].(string)
-	if !ok {
-		return
+	if service, ok := mirroring["service"].(string); ok {
+		mirroring["service"] = sanitizeReference(service, mappings.services)
 	}
-	mirroring["service"] = sanitizeReference(service, mappings.services)
-}
-
-func sanitizeMirroringMirrors(mirroring map[string]interface{}, mappings *nameMappings) {
-	mirrors, ok := mirroring["mirrors"].([]interface{})
-	if !ok {
-		return
-	}
-	for _, mirror := range mirrors {
-		mirrorMap, ok := mirror.(map[string]interface{})
-		if !ok {
-			continue
+	if mirrors, ok := mirroring["mirrors"].([]interface{}); ok {
+		for _, mirror := range mirrors {
+			if mirrorMap, ok := mirror.(map[string]interface{}); ok {
+				if name, ok := mirrorMap["name"].(string); ok {
+					mirrorMap["name"] = sanitizeReference(name, mappings.services)
+				}
+			}
 		}
-		name, ok := mirrorMap["name"].(string)
-		if !ok {
-			continue
-		}
-		mirrorMap["name"] = sanitizeReference(name, mappings.services)
 	}
-	mirroring["mirrors"] = mirrors
 }
 
 // sanitizeFailoverSection rewrites failover service & fallback names.
@@ -343,13 +360,18 @@ func sanitizeFailoverSection(obj map[string]interface{}, mappings *nameMappings)
 		if fallback, ok := failover["fallback"].(string); ok {
 			failover["fallback"] = sanitizeReference(fallback, mappings.services)
 		}
-		obj["failover"] = failover
 	}
 }
 
+// sanitizeReference maps a reference to the Kubernetes name of the object it
+// points at. A name defined in the same config always wins; an undefined name
+// containing "@" is a cross-provider reference and is kept as-is.
 func sanitizeReference(name string, mapping map[string]string) string {
 	if sanitized, exists := mapping[name]; exists {
 		return sanitized
+	}
+	if IsCrossProviderRef(name) {
+		return name
 	}
 	return SanitizeResourceName(name)
 }

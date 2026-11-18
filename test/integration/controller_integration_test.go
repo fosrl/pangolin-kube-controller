@@ -274,13 +274,37 @@ func TestApplyAllThreeKinds(t *testing.T) {
 	mwRefs, _ := route["middlewares"].([]interface{})
 	require.Contains(t, mwRefs, map[string]interface{}{"name": "mw1"})
 
-	// TraefikService has the server URL.
-	tsSpec := specOf(t, ts)
-	lb, _ := tsSpec["loadBalancer"].(map[string]interface{})
-	servers, _ := lb["servers"].([]interface{})
-	require.Len(t, servers, 1)
-	server0, _ := servers[0].(map[string]interface{})
-	require.Equal(t, "http://10.0.0.1:80", server0["url"]) // NOSONAR
+	// TLS options are a TLSOption reference object in the CRD.
+	tls, _ := spec["tls"].(map[string]interface{})
+	require.Equal(t, map[string]interface{}{"name": "default"}, tls["options"])
+
+	// The TraefikService points at a generated Service whose EndpointSlice
+	// carries the server address.
+	requireBackend(t, ns, ts, "pkc-svc1", "10.0.0.1", 80)
+}
+
+// requireBackend checks that a TraefikService has one weighted child pointing
+// at the named generated Service, and that the Service's EndpointSlice holds
+// addr:port under the port name Traefik matches on.
+func requireBackend(t *testing.T, ns string, ts *unstructured.Unstructured, svcName, addr string, port int32) {
+	t.Helper()
+	weighted, _ := specOf(t, ts)["weighted"].(map[string]interface{})
+	children, _ := weighted["services"].([]interface{})
+	require.Len(t, children, 1)
+	child, _ := children[0].(map[string]interface{})
+	require.Equal(t, svcName, child["name"])
+	require.Equal(t, "Service", child["kind"])
+	require.Equal(t, "web", child["port"])
+
+	_, err := kubeCli.CoreV1().Services(ns).Get(context.Background(), svcName, metav1.GetOptions{})
+	require.NoError(t, err)
+	slices, err := kubeCli.DiscoveryV1().EndpointSlices(ns).List(context.Background(), metav1.ListOptions{LabelSelector: "kubernetes.io/service-name=" + svcName})
+	require.NoError(t, err)
+	require.Len(t, slices.Items, 1)
+	es := slices.Items[0]
+	require.Equal(t, "web", *es.Ports[0].Name)
+	require.Equal(t, port, *es.Ports[0].Port)
+	require.Equal(t, []string{addr}, es.Endpoints[0].Addresses)
 }
 
 func TestIdempotentSSANoSpecChangeOnReapply(t *testing.T) {
@@ -463,8 +487,9 @@ func TestTraefikServiceFillDefaultLBURL(t *testing.T) {
 
 	res := dynCli.Resource(traefikServiceGVR).Namespace(ns)
 	ts := eventuallyGet(t, res, "svc1")
-	lb := specOf(t, ts)["loadBalancer"].(map[string]interface{})
-	servers := lb["servers"].([]interface{})
-	server0 := servers[0].(map[string]interface{})
-	require.Equal(t, "http://1.2.3.4:8080", server0["url"]) // NOSONAR
+	requireBackend(t, ns, ts, "pkc-svc1", "1.2.3.4", 8080)
+
+	// A router without entry points is written without the field.
+	ir := eventuallyGet(t, dynCli.Resource(ingressRouteGVR).Namespace(ns), "r1")
+	require.NotContains(t, specOf(t, ir), "entryPoints")
 }

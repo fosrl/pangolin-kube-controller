@@ -158,35 +158,28 @@ Purpose: quick, non-developer friendly guide to what each Go file does and why i
 - internal/testschema/validate_test.go — Tests validate.
 
 ## internal/testutil
+- internal/testutil/apply_reactor.go — Go source file.
 - internal/testutil/consts.go — Go source file.
 - internal/testutil/doc.go — Package testutil contains generic helpers used by tests across packages,
 - internal/testutil/helpers.go — Go source file.
 - internal/testutil/helpers_test.go — Tests helpers.
 
 ## internal/transform
+- internal/transform/backend/backend.go — Package backend turns the server lists of Pangolin's Traefik dynamic
+- internal/transform/backend/backend_test.go — Tests backend.
 - internal/transform/config/config.go — Go source file.
 - internal/transform/config/config_test.go — Tests config.
 - internal/transform/config/doc.go — Package config defines a lightweight model of Traefik dynamic configuration
 - internal/transform/doc.go — Package transform provides Traefik configuration transformation, including
-- internal/transform/protocol/address_type_test.go — Tests address type.
 - internal/transform/protocol/doc.go — Package protocol contains helpers for HTTP and TCP/UDP protocol handling
-- internal/transform/protocol/endpoint_slice_test.go — Tests endpoint slice.
 - internal/transform/protocol/env_url_test.go — Tests env url.
 - internal/transform/protocol/http_conversion.go — Go source file.
 - internal/transform/protocol/http_conversion_regression_test.go — Tests http conversion regression.
 - internal/transform/protocol/http_conversion_test.go — Tests http conversion.
-- internal/transform/protocol/loadbalancer_error_test.go — Tests loadbalancer error.
-- internal/transform/protocol/port_parse_test.go — Tests port parse.
-- internal/transform/protocol/process_services_test.go — Tests process services.
-- internal/transform/protocol/servers_transport_inject_test.go — Tests servers transport inject.
-- internal/transform/protocol/service_processing_test.go — Tests service processing.
-- internal/transform/protocol/service_target_equals_test.go — Tests service target equals.
-- internal/transform/protocol/service_target_test.go — Tests service target.
-- internal/transform/protocol/service_url_port_test.go — Tests service url port.
-- internal/transform/protocol/split_host_port_test.go — Tests split host port.
 - internal/transform/protocol/tcp_udp.go — Go source file.
-- internal/transform/protocol/tcp_udp_additional_test.go — Tests tcp udp additional.
 - internal/transform/protocol/tcp_udp_test.go — Tests tcp udp.
+- internal/transform/protocol/tls.go — Go source file.
+- internal/transform/protocol/tls_test.go — Tests tls.
 - internal/transform/routing/annotation_test.go — Tests annotation.
 - internal/transform/routing/doc.go — Package routing converts simplified router definitions to Traefik
 - internal/transform/routing/entrypoints_annotation_test.go — Tests entrypoints annotation.
@@ -215,11 +208,12 @@ Purpose: quick, non-developer friendly guide to what each Go file does and why i
 - internal/version/version_test.go — Tests version.
 
 ## test
-- test/assets.go — Integration/E2E test helpers and assets.
 - test/e2e/doc.go — Package e2e contains end-to-end style helpers and tests that validate the
 - test/e2e/helpers.go — Integration/E2E test helpers and assets.
 - test/e2e/helpers_test.go — Tests helpers.
 - test/e2e/offline_e2e_test.go — Tests offline e2e.
+- test/e2e/pangolin_e2e_test.go — Tests pangolin e2e.
 - test/integration/controller_integration_test.go — Tests controller integration.
+- test/integration/pangolin_integration_test.go — Tests pangolin integration.
 - test/integration/suite_test.go — Tests suite.
 

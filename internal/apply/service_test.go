@@ -20,18 +20,6 @@ func TestBoolPtr(t *testing.T) {
 	}
 }
 
-func TestIgnoreFieldValidation(t *testing.T) {
-	if IgnoreFieldValidation("TraefikService") != true {
-		t.Error("IgnoreFieldValidation(TraefikService) = false, want true")
-	}
-	if IgnoreFieldValidation("IngressRoute") != false {
-		t.Error("IgnoreFieldValidation(IngressRoute) = true, want false")
-	}
-	if IgnoreFieldValidation("Middleware") != false {
-		t.Error("IgnoreFieldValidation(Middleware) = true, want false")
-	}
-}
-
 func TestKindFor(t *testing.T) {
 	tests := []struct {
 		resource string

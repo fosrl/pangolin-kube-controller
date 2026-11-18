@@ -1,0 +1,300 @@
+{
+  "http": {
+    "middlewares": {
+      "redirect-to-https": {
+        "redirectScheme": {
+          "scheme": "https"
+        }
+      },
+      "badger": {
+        "plugin": {
+          "badger": {
+            "apiBaseUrl": "http://pangolin.pangolin.svc.cluster.local:3001/api/v1",
+            "disableDefaultCFIPs": false,
+            "customIPHeader": "",
+            "trustip": [],
+            "userSessionCookieName": "p_session_token",
+            "resourceSessionRequestParam": "resource_session_request_param",
+            "remoteUserIdHeader": "Remote-User-Id"
+          }
+        }
+      },
+      "resource-1-mtls-headers": {
+        "passTLSClientCert": {
+          "pem": false,
+          "info": {
+            "notAfter": true,
+            "notBefore": true,
+            "serialNumber": true,
+            "sans": true,
+            "subject": {
+              "commonName": true,
+              "organization": true
+            },
+            "issuer": {
+              "commonName": true,
+              "organization": true
+            }
+          }
+        }
+      },
+      "1-app-headers-middleware": {
+        "headers": {
+          "customRequestHeaders": {
+            "X-Env": "prod"
+          },
+          "customResponseHeaders": {
+            "X-Served-By": "pangolin"
+          }
+        }
+      },
+      "rewrite-r2-2-api-prefix": {
+        "replacePathRegex": {
+          "regex": "^/api(.*)",
+          "replacement": "$1"
+        }
+      },
+      "auth-chain": {
+        "chain": {
+          "middlewares": [
+            "badger",
+            "1-app-headers-middleware"
+          ]
+        }
+      },
+      "7-redirect-old": {
+        "redirectRegex": {
+          "regex": "^https?://old\\.example\\.com/(.*)",
+          "replacement": "https://new.example.com/${1}",
+          "permanent": true
+        }
+      }
+    },
+    "routers": {
+      "1-app-router": {
+        "entryPoints": [
+          "websecure"
+        ],
+        "middlewares": [
+          "resource-1-mtls-headers",
+          "badger",
+          "crowdsec@file",
+          "1-app-headers-middleware"
+        ],
+        "service": "1-app-service",
+        "rule": "Host(`app.example.com`)",
+        "priority": 100,
+        "tls": {
+          "certResolver": "letsencrypt",
+          "options": "resource-1-mtls"
+        }
+      },
+      "1-app-router-redirect": {
+        "entryPoints": [
+          "web"
+        ],
+        "middlewares": [
+          "redirect-to-https"
+        ],
+        "service": "1-app-service",
+        "rule": "Host(`app.example.com`)",
+        "priority": 100
+      },
+      "2-api-router": {
+        "entryPoints": [
+          "websecure"
+        ],
+        "middlewares": [
+          "badger",
+          "rewrite-r2-2-api-prefix"
+        ],
+        "service": "2-api-service",
+        "rule": "Host(`api.example.com`) && PathPrefix(`/api`)",
+        "priority": 110,
+        "tls": {
+          "certResolver": "letsencrypt",
+          "domains": [
+            {
+              "main": "example.com",
+              "sans": [
+                "*.example.com"
+              ]
+            }
+          ]
+        }
+      },
+      "3-lan-router": {
+        "entryPoints": [
+          "websecure"
+        ],
+        "middlewares": [
+          "auth-chain"
+        ],
+        "service": "3-lan-service",
+        "rule": "Host(`lan.example.com`)",
+        "priority": 100,
+        "tls": {
+          "certResolver": "letsencrypt"
+        }
+      },
+      "4-maintenance-router": {
+        "entryPoints": [
+          "websecure"
+        ],
+        "service": "4-maintenance-service",
+        "rule": "Host(`down.example.com`)",
+        "priority": 100,
+        "tls": {}
+      },
+      "7-redirect-old-router": {
+        "entryPoints": [
+          "websecure"
+        ],
+        "middlewares": [
+          "badger",
+          "7-redirect-old"
+        ],
+        "service": "noop@internal",
+        "rule": "Host(`old.example.com`)",
+        "priority": 100,
+        "tls": {
+          "certResolver": "letsencrypt"
+        }
+      }
+    },
+    "services": {
+      "1-app-service": {
+        "loadBalancer": {
+          "servers": [
+            {
+              "url": "http://100.89.128.4:44602"
+            },
+            {
+              "url": "http://100.89.128.4:44603"
+            },
+            {
+              "url": "http://100.89.128.8:41000"
+            }
+          ],
+          "strategy": "p2c",
+          "sticky": {
+            "cookie": {
+              "name": "p_sticky",
+              "secure": true,
+              "httpOnly": true
+            }
+          }
+        }
+      },
+      "2-api-service": {
+        "loadBalancer": {
+          "servers": [
+            {
+              "url": "https://10.0.0.5:8443"
+            },
+            {
+              "url": "http://[fd00::5]:8080"
+            },
+            {
+              "url": "http://app.lan:8080"
+            }
+          ],
+          "serversTransport": "2-transport"
+        }
+      },
+      "3-lan-service": {
+        "loadBalancer": {
+          "servers": [
+            {
+              "url": "http://10.0.0.6:80"
+            }
+          ]
+        }
+      },
+      "4-maintenance-service": {
+        "loadBalancer": {
+          "servers": [
+            {
+              "url": "http://pangolin.pangolin.svc.cluster.local:3002"
+            }
+          ],
+          "passHostHeader": true
+        }
+      }
+    },
+    "serversTransports": {
+      "2-transport": {
+        "serverName": "api.internal",
+        "insecureSkipVerify": true
+      }
+    }
+  },
+  "tcp": {
+    "routers": {
+      "5-ssh-router": {
+        "entryPoints": [
+          "tcp-2222"
+        ],
+        "service": "5-ssh-service",
+        "rule": "HostSNI(`*`)"
+      }
+    },
+    "services": {
+      "5-ssh-service": {
+        "loadBalancer": {
+          "servers": [
+            {
+              "address": "100.89.128.4:40022"
+            },
+            {
+              "address": "100.89.128.4:40023"
+            }
+          ],
+          "serversTransport": "pp-transport-v1@file",
+          "sticky": {
+            "ipStrategy": {
+              "depth": 0,
+              "sourcePort": true
+            }
+          }
+        }
+      }
+    }
+  },
+  "udp": {
+    "routers": {
+      "6-dns-router": {
+        "entryPoints": [
+          "udp-5353"
+        ],
+        "service": "6-dns-service"
+      }
+    },
+    "services": {
+      "6-dns-service": {
+        "loadBalancer": {
+          "servers": [
+            {
+              "address": "100.89.128.8:45353"
+            },
+            {
+              "address": "100.89.128.9:45353"
+            }
+          ]
+        }
+      }
+    }
+  },
+  "tls": {
+    "options": {
+      "resource-1-mtls": {
+        "clientAuth": {
+          "caFiles": [
+            "-----BEGIN CERTIFICATE-----\nMIIBazCCARKgAwIBAgIUL5Iw6fuxpMo0k3fxTrQrfKrcpoAwCgYIKoZIzj0EAwIw\nHDEaMBgGA1UEAwwRRXhhbXBsZSBDbGllbnQgQ0EwHhcNMjYxMTE4MTkxODMyWhcN\nMzYxMTE1MTkxODMyWjAcMRowGAYDVQQDDBFFeGFtcGxlIENsaWVudCBDQTBZMBMG\nByqGSM49AgEGCCqGSM49AwEHA0IABM4q5BCKIyv9latJVsS98W6EsQmQuO8NP1XI\nYecneS1rpU0SduYH7Ri4s9VRsuWCRaD+0/Bfp/fDxFI6fyqqYUyjMjAwMB0GA1Ud\nDgQWBBQhV/yY9T8dNaahoVH0aghUHM3f0zAPBgNVHRMBAf8EBTADAQH/MAoGCCqG\nSM49BAMCA0cAMEQCIGr+yTDORMg/+cYfbTkOzgIKiW/jlldfozBP1SB5y1D7AiBl\nOOhl3pWSkqc75wqZoD9CMxKSchW7sgrOfanS1PNAQA==\n-----END CERTIFICATE-----"
+          ],
+          "clientAuthType": "RequireAndVerifyClientCert"
+        }
+      }
+    }
+  }
+}
