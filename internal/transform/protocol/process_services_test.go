@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	discoveryv1 "k8s.io/api/discovery/v1"
 
 	"pangolin-kube-controller/internal/config"
 )
@@ -190,6 +191,50 @@ func TestProcessServicesKubeServiceConversion(t *testing.T) {
 	// After conversion, loadBalancer should be replaced by weighted.
 	require.Contains(t, spec, "weighted")
 	require.NotContains(t, spec, "loadBalancer")
+}
+
+func TestProcessHTTPServicesExternalTunnelTarget(t *testing.T) {
+	t.Parallel()
+
+	const (
+		serviceName = "svc"
+		port        = 8443
+		kubeName    = "svc-8443"
+	)
+	services := map[string]json.RawMessage{
+		serviceName: json.RawMessage(`{"loadBalancer":{"servers":[{"url":"https://192.0.2.1:8443"}],"serversTransport":"transport","sticky":{"cookie":{"name":"sticky"}}}}`),
+	}
+
+	processed, kubeServices, endpointSlices, err := ProcessHTTPServices(&config.Config{}, services, "traefik")
+	require.NoError(t, err)
+	require.Len(t, kubeServices, 1)
+	require.Len(t, endpointSlices, 1)
+
+	service := kubeServices[0]
+	require.Equal(t, kubeName, service.Name)
+	require.Equal(t, "traefik", service.Namespace)
+	require.Equal(t, "None", service.Spec.ClusterIP)
+	require.EqualValues(t, port, service.Spec.Ports[0].Port)
+	require.Equal(t, "http", service.Labels[ArtifactProtocolLabel])
+
+	endpointSlice := endpointSlices[0]
+	require.Equal(t, discoveryv1.AddressTypeIPv4, endpointSlice.AddressType)
+	require.Equal(t, []string{"192.0.2.1"}, endpointSlice.Endpoints[0].Addresses)
+	require.Equal(t, kubeName, endpointSlice.Labels[discoveryv1.LabelServiceName])
+
+	var spec map[string]interface{}
+	require.NoError(t, json.Unmarshal(processed[serviceName], &spec))
+	require.NotContains(t, spec, "loadBalancer")
+	weighted := spec["weighted"].(map[string]interface{})
+	entries := weighted["services"].([]interface{})
+	entry := entries[0].(map[string]interface{})
+	require.Equal(t, kubeName, entry["name"])
+	require.Equal(t, "traefik", entry["namespace"])
+	require.Equal(t, "Service", entry["kind"])
+	require.Equal(t, "https", entry["scheme"])
+	require.Equal(t, "transport", entry["serversTransport"])
+	require.Contains(t, entry, "sticky")
+	require.EqualValues(t, port, entry["port"])
 }
 
 func TestProcessServicesPreservesNonConvertible(t *testing.T) {
