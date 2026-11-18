@@ -24,6 +24,9 @@ on:
         required: false
       DOCKER_HUB_ACCESS_TOKEN:
         required: false
+      DOCKER_HUB_USERNAME:
+        description: Docker Hub account that owns DOCKER_HUB_ACCESS_TOKEN (the login user, not the image namespace)
+        required: false
     outputs:
       digest:
         description: Image digest
@@ -157,7 +160,10 @@ jobs:
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: docker.io
-          username: ${{ vars.DOCKER_HUB_USERNAME }}
+          # The login account is the one the org token belongs to (org secret
+          # DOCKER_HUB_USERNAME, as in the other fosrl repos). vars.DOCKER_HUB_USERNAME
+          # is only the image namespace (docker.io/fosrl/...).
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}
           password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
 
       - name: Install Go
