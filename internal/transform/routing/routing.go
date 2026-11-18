@@ -9,8 +9,11 @@ import (
 )
 
 const (
-	// IngressClassAnnotation is applied to Traefik IngressRoute metadata.
-	IngressClassAnnotation = "traefikconfig.ingress.kubernetes.io/router.ingressclass"
+	// IngressClassAnnotation selects the Traefik instance that serves a route.
+	// Traefik's kubernetescrd provider reads it on IngressRoute,
+	// IngressRouteTCP and IngressRouteUDP (spec.ingressClassName only exists
+	// from Traefik 3.7 on).
+	IngressClassAnnotation = "kubernetes.io/ingress.class"
 	// RouterEntryPointsAnnotation mirrors spec.entryPoints for visibility.
 	RouterEntryPointsAnnotation = "traefikconfig.ingress.kubernetes.io/router.entrypoints"
 )
@@ -92,11 +95,15 @@ func TransformRouterToIngressRoute(name string, raw json.RawMessage, cfg RouterC
 	route := buildRoute(rule, serviceName, mws, priorityVal)
 
 	spec := map[string]interface{}{
-		"entryPoints": eps,
-		"routes":      []interface{}{route},
+		"routes": []interface{}{route},
+	}
+	// A nil slice would be written as `entryPoints: null`, which the CRD
+	// rejects. Without entry points Traefik uses its default ones.
+	if len(eps) > 0 {
+		spec["entryPoints"] = eps
 	}
 	if len(tlsObj) > 0 {
-		spec["tls"] = tlsObj
+		spec["tls"] = convertTLS(tlsObj)
 	}
 	u := map[string]interface{}{
 		"apiVersion": traefikconfig.GroupVersion,
@@ -182,4 +189,23 @@ func buildRoute(rule, serviceName string, mws []string, priorityVal float64) map
 		route["priority"] = int(priorityVal)
 	}
 	return route
+}
+
+// convertTLS turns a dynamic-config router TLS block into the IngressRoute
+// form, where `options` is a TLSOption reference object instead of a name.
+// Passing the bare string through made the API server reject (or Traefik
+// ignore) the mTLS options Pangolin attaches to a resource.
+func convertTLS(tls map[string]interface{}) map[string]interface{} {
+	out := make(map[string]interface{}, len(tls))
+	for k, v := range tls {
+		out[k] = v
+	}
+	if opt, ok := out["options"].(string); ok {
+		if opt == "" {
+			delete(out, "options")
+		} else {
+			out["options"] = map[string]interface{}{"name": opt}
+		}
+	}
+	return out
 }

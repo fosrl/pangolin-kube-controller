@@ -41,6 +41,7 @@ type Controller struct {
 	gvrIngressRouteTCP     schema.GroupVersionResource
 	gvrIngressRouteUDP     schema.GroupVersionResource
 	gvrServersTransportTCP schema.GroupVersionResource
+	gvrTLSOption           schema.GroupVersionResource
 
 	gcSem chan struct{}
 
@@ -66,6 +67,7 @@ var resourceToKind = map[string]string{
 	"ingressroutetcps":     "IngressRouteTCP",
 	"ingressrouteudps":     "IngressRouteUDP",
 	"serverstransporttcps": "ServersTransportTCP",
+	"tlsoptions":           "TLSOption",
 	"services":             "Service",
 	"routers":              "Router",
 	"sites":                "Site",
@@ -117,6 +119,11 @@ func NewController(cfg *config.Config, dyn dynamic.Interface, kube kubernetes.In
 			Group:    traefikconfig.Group,
 			Version:  traefikconfig.Version,
 			Resource: "serverstransporttcps",
+		},
+		gvrTLSOption: schema.GroupVersionResource{
+			Group:    traefikconfig.Group,
+			Version:  traefikconfig.Version,
+			Resource: "tlsoptions",
 		},
 	}
 

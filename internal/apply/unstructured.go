@@ -3,6 +3,7 @@ package apply
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"time"
 
 	logrus "github.com/sirupsen/logrus"
@@ -11,7 +12,9 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/util/csaupgrade"
 
 	"pangolin-kube-controller/internal/kube/resources"
 	traefikconfig "pangolin-kube-controller/internal/transform/config"
@@ -35,13 +38,11 @@ func KindFor(resource string) string {
 		return "IngressRouteUDP"
 	case "serverstransporttcps":
 		return "ServersTransportTCP"
+	case "tlsoptions":
+		return "TLSOption"
 	default:
 		return resource
 	}
-}
-
-func IgnoreFieldValidation(kind string) bool {
-	return kind == "TraefikService"
 }
 
 func BoolPtr(v bool) *bool {
@@ -94,27 +95,46 @@ func (o *UnstructuredOps) Apply(ctx context.Context, name string, raw json.RawMe
 	var force bool
 	meta, force = BuildMetadataForApply(existing, name, o.Namespace, kind, metaCfg)
 	u["metadata"] = meta
-	return PatchUnstructured(ctx, resIfc, name, u, existing, kind, PatchConfig{Force: force, SSAForce: o.SSAForce})
+	return PatchUnstructured(ctx, resIfc, name, u, existing, kind, PatchConfig{Force: true, SSAForce: o.SSAForce || force})
 }
 
 func CreateUnstructured(ctx context.Context, resIfc resources.ResourceClient, u map[string]interface{}, kind string) error {
+	// Objects are created with server-side apply, never with a plain Create:
+	// a Create records an Update-operation field manager, and fields owned by
+	// it survive later applies even after Pangolin stops emitting them.
 	bytes, err := json.Marshal(u)
 	if err != nil {
 		return err
 	}
-	obj := &unstructured.Unstructured{}
-	if err := obj.UnmarshalJSON(bytes); err != nil {
+	meta, _ := u["metadata"].(map[string]interface{})
+	name, _ := meta["name"].(string)
+	if err := ApplySSAWithRetry(ctx, resIfc, name, bytes, kind, SSAOptions{Force: true}); err != nil {
 		return err
 	}
-	createOpts := metav1.CreateOptions{}
-	if IgnoreFieldValidation(kind) {
-		createOpts.FieldValidation = metav1.FieldValidationIgnore
+	logrus.Infof("Created %s %s", kind, name)
+	return nil
+}
+
+// LegacyFieldManagers are the managers 0.1.0-alpha.1 recorded with its
+// Create/Update calls: it set no field manager, so the API server used the
+// binary name.
+var LegacyFieldManagers = sets.New("controller", FieldManager)
+
+// UpgradeLegacyOwnership hands the fields owned by an alpha.1 Create/Update
+// manager over to the server-side apply manager, so a later apply can remove
+// them. It is a no-op for objects that never had such a manager.
+func UpgradeLegacyOwnership(ctx context.Context, resIfc resources.ResourceClient, existing *unstructured.Unstructured) error {
+	if existing == nil {
+		return nil
 	}
-	_, err = resIfc.Create(ctx, obj, createOpts)
-	if err != nil {
+	patch, err := csaupgrade.UpgradeManagedFieldsPatch(existing, LegacyFieldManagers, FieldManager)
+	if err != nil || len(patch) == 0 {
 		return err
 	}
-	logrus.Infof("Created %s %s", kind, obj.GetName())
+	if _, err := resIfc.Patch(ctx, existing.GetName(), types.JSONPatchType, patch, metav1.PatchOptions{}); err != nil {
+		return fmt.Errorf("upgrade field ownership of %s %s: %w", existing.GetKind(), existing.GetName(), err)
+	}
+	logrus.Infof("Migrated field ownership of %s %s to server-side apply", existing.GetKind(), existing.GetName())
 	return nil
 }
 
@@ -123,6 +143,9 @@ func PatchUnstructured(ctx context.Context, resIfc resources.ResourceClient, nam
 		if changed := DiffSpecKeys(existing, u); len(changed) > 0 {
 			logrus.Infof("Semantic changes for %s %s: %v", kind, name, changed)
 		}
+	}
+	if err := UpgradeLegacyOwnership(ctx, resIfc, existing); err != nil {
+		return err
 	}
 	forceOverride := ForceNeededForMetadata(existing, u)
 	patchBytes, err := json.Marshal(u)
@@ -146,9 +169,6 @@ func ApplySSAWithRetry(ctx context.Context, resIfc resources.ResourceClient, nam
 	}
 	if useForce {
 		patchOpts.Force = BoolPtr(true)
-	}
-	if IgnoreFieldValidation(kind) {
-		patchOpts.FieldValidation = metav1.FieldValidationIgnore
 	}
 
 	backoff := 50 * time.Millisecond

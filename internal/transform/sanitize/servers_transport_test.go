@@ -48,7 +48,7 @@ func TestHTTPServersTransportMappingAndValidation(t *testing.T) {
 	// Validate one ServersTransport object against CRD schema
 	version := os.Getenv("TRAEFIK_CRD_VERSION")
 	if version == "" {
-		version = "v3.5.0"
+		version = "v3.5.6"
 	}
 	crds, err := testschema.LoadTraefikCRDs(version)
 	require.NoError(t, err)

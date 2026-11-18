@@ -42,8 +42,10 @@ func TestOfflineE2EExtendedHTTPTCPUDP(t *testing.T) {
 		{Group: traefikGroupLocal, Version: "v1alpha1", Resource: "ingressroutetcps"}:     "IngressRouteTCPList",
 		{Group: traefikGroupLocal, Version: "v1alpha1", Resource: "ingressrouteudps"}:     "IngressRouteUDPList",
 		{Group: traefikGroupLocal, Version: "v1alpha1", Resource: "serverstransporttcps"}: "ServersTransportTCPList",
+		{Group: traefikGroupLocal, Version: "v1alpha1", Resource: "tlsoptions"}:           "TLSOptionList",
 	}
 	dyn := fake.NewSimpleDynamicClientWithCustomListKinds(sch, listKinds)
+	tst.InstallApplyReactor(dyn)
 	kube := fakekube.NewClientset()
 
 	cfg := config.LoadFromEnv()
@@ -67,7 +69,7 @@ func TestOfflineE2EExtendedHTTPTCPUDP(t *testing.T) {
 	require.NoError(t, c.ApplyConfigForTest(ctx, &tc))
 
 	// Validate CRDs against schemas
-	crds, err := testschema.LoadTraefikCRDs(TraefikVersion(traefikExtendedVersionTag))
+	crds, err := testschema.LoadTraefikCRDs(TraefikVersion("v3.5.6"))
 	require.NoError(t, err)
 	crdMap := testschema.MapCRDByKind(crds)
 

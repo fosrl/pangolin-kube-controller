@@ -28,10 +28,10 @@ func TestHTTPConversionExtendedBasic(t *testing.T) {
 	sanitized, err := sanitize.SanitizeTraefikConfig(&cfg)
 	require.NoError(t, err)
 
-	// Load embedded CRDs for schema validation (default v3.5.0); if not found, fall back to v3.5.0 bundled for integration.
+	// Load embedded CRDs for schema validation (default: the real Traefik v3.5.6 CRDs).
 	version := os.Getenv("TRAEFIK_CRD_VERSION")
 	if version == "" {
-		version = "v3.5.0"
+		version = "v3.5.6"
 	}
 	crds, err := testschema.LoadTraefikCRDs(version)
 	require.NoError(t, err, "load CRDs for "+version)
@@ -46,8 +46,12 @@ func TestHTTPConversionExtendedBasic(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, testschema.Validate(mwObj, crdMap), 0)
 
+	// Pangolin's loadBalancer services are not valid TraefikServices; they
+	// must go through TransformHTTPServices first.
 	tsName := "1-test-1-service"
-	tsRaw, ok := sanitized.HTTP.Services[tsName]
+	art := TransformHTTPServices(nil, namespace, sanitized.HTTP.Services)
+	require.Empty(t, art.Failed)
+	tsRaw, ok := art.TraefikServices[tsName]
 	require.True(t, ok, "expected service %s", tsName)
 	tsObj, err := testutil.BuildTraefikObject("TraefikService", tsName, namespace, tsRaw)
 	require.NoError(t, err)

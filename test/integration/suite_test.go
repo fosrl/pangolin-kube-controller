@@ -14,8 +14,6 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/util/flowcontrol"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
-
-	testassets "pangolin-kube-controller/test"
 )
 
 var (
@@ -26,21 +24,20 @@ var (
 )
 
 func TestMain(m *testing.M) {
-	// Materialize embedded CRDs to a temp dir for envtest.
-	crdDir, err := testassets.WriteCRDsToTempDir()
-	if err != nil {
-		panic(err)
+	// Real Traefik CRDs, so the API server validates and prunes exactly as it
+	// does in a cluster. TRAEFIK_CRD_VERSION selects another vendored version.
+	crdVersion := os.Getenv("TRAEFIK_CRD_VERSION")
+	if crdVersion == "" {
+		crdVersion = "v3.7.19"
 	}
-	defer os.RemoveAll(crdDir)
-
-	// Add embedded CRDs plus Traefik CRDs from testdata (for ServersTransport etc.).
-	traefikCRDDir := filepath.Join("..", "testdata", "crds", "traefik", "v3.5.0")
+	traefikCRDDir := filepath.Join("..", "testdata", "crds", "traefik", crdVersion)
 	testEnv = &envtest.Environment{
-		CRDDirectoryPaths:     []string{crdDir, traefikCRDDir},
+		CRDDirectoryPaths:     []string{traefikCRDDir},
 		ErrorIfCRDPathMissing: true,
 	}
 
 	// Start the control plane.
+	var err error
 	restCfg, err = testEnv.Start()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "envtest start failed (missing binaries or CRDs?): %v\n", err)

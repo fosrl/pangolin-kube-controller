@@ -3,243 +3,275 @@ package protocol
 import (
 	"encoding/json"
 	"fmt"
-	"net/url"
-	"strconv"
+	"sort"
 	"strings"
 
 	logrus "github.com/sirupsen/logrus"
+	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 
 	"pangolin-kube-controller/internal/config"
+	"pangolin-kube-controller/internal/transform/backend"
+	"pangolin-kube-controller/internal/transform/sanitize"
 )
 
-type kubeServiceTarget struct {
-	name      string
-	namespace string
-	port      int
-	scheme    string
+// HTTPPortName is the Service port name used for HTTP backends.
+const HTTPPortName = "web"
+
+// lbChildOptions are the loadBalancer options Traefik accepts on a service
+// reference (TraefikService weighted child / IngressRoute service). They are
+// copied from Pangolin's loadBalancer onto every generated reference.
+var lbChildOptions = []string{"sticky", "strategy", "passHostHeader", "serversTransport", "responseForwarding", "passiveHealthCheck"}
+
+// HTTPArtifacts is the Kubernetes representation of Pangolin's HTTP services.
+type HTTPArtifacts struct {
+	// TraefikServices maps the sanitized Pangolin service name to a
+	// TraefikService spec. IngressRoutes keep referencing services by that name.
+	TraefikServices map[string]json.RawMessage
+	Services        []*corev1.Service
+	Slices          []*discoveryv1.EndpointSlice
+	// Failed lists services that could not be converted. Their existing
+	// objects must be kept rather than garbage-collected.
+	Failed map[string]error
 }
 
-// ProcessServices rewrites TraefikService specs for load balancer conversions and logging.
-func ProcessServices(cfg *config.Config, services map[string]json.RawMessage) map[string]json.RawMessage {
-	if services == nil {
-		return nil
+// TransformHTTPServices converts sanitized HTTP services into TraefikServices
+// plus the selectorless Services/EndpointSlices that carry their servers.
+//
+// A loadBalancer becomes a `weighted` TraefikService whose children reference
+// Kubernetes Services: TraefikService has no loadBalancer field, and the API
+// server prunes one silently, which left every tunnel-backed resource without
+// servers. A server that is already a Service in the target namespace
+// ("<name>.<ns>.svc...") is referenced directly; everything else (WireGuard
+// peer addresses, LAN addresses, hostnames) goes through generated Services.
+func TransformHTTPServices(cfg *config.Config, namespace string, services map[string]json.RawMessage) HTTPArtifacts {
+	out := HTTPArtifacts{
+		TraefikServices: make(map[string]json.RawMessage, len(services)),
+		Failed:          map[string]error{},
 	}
-	out := make(map[string]json.RawMessage, len(services))
-	for name, raw := range services {
-		out[name] = processSingleService(cfg, name, raw)
+	for _, name := range sortedKeys(services) {
+		spec, svcs, slices, err := transformHTTPService(cfg, namespace, name, services[name], services)
+		if err != nil {
+			out.Failed[name] = err
+			continue
+		}
+		out.TraefikServices[name] = spec
+		out.Services = append(out.Services, svcs...)
+		out.Slices = append(out.Slices, slices...)
 	}
 	return out
 }
 
-func processSingleService(cfg *config.Config, name string, raw json.RawMessage) json.RawMessage {
-	trim := strings.TrimSpace(string(raw))
-	if trim != "" && trim != "{}" {
-		return processNonEmptyService(name, raw)
-	}
-	return processEmptyService(cfg, name, raw)
-}
-
-func processNonEmptyService(name string, raw json.RawMessage) json.RawMessage {
+func transformHTTPService(cfg *config.Config, namespace, name string, raw json.RawMessage, all map[string]json.RawMessage) (json.RawMessage, []*corev1.Service, []*discoveryv1.EndpointSlice, error) {
+	trimmed := strings.TrimSpace(string(raw))
 	var spec map[string]interface{}
-	if err := json.Unmarshal(raw, &spec); err == nil {
-		if target, ok := convertLoadBalancerToK8sService(spec); ok {
-			if b, err := json.Marshal(spec); err == nil {
-				raw = b
-				logrus.Infof("TraefikService %s converted to Kubernetes Service %s/%s port=%d scheme=%s", name, target.namespace, target.name, target.port, target.scheme)
-			} else {
-				logrus.Warnf("TraefikService %s conversion marshal failed: %v", name, err)
-			}
-		} else if urls := extractServiceURLs(spec); len(urls) > 0 {
-			logrus.Infof("TraefikService %s servers=%v", name, urls)
+	if trimmed != "" && trimmed != "null" {
+		if err := json.Unmarshal(raw, &spec); err != nil {
+			return nil, nil, nil, fmt.Errorf("service %s: %w", name, err)
 		}
 	}
-	return raw
-}
+	if len(spec) == 0 {
+		// Legacy behaviour: an empty service is pointed at TRAEFIK_LB_URL.
+		fallback := getTraefikEnvURL(cfg)
+		if fallback == "" {
+			return nil, nil, nil, fmt.Errorf("service %s has an empty spec and TRAEFIK_LB_URL/TRAEFIK_LB_IP are not set", name)
+		}
+		spec = map[string]interface{}{"loadBalancer": map[string]interface{}{"servers": []interface{}{map[string]interface{}{"url": fallback}}}}
+		logrus.Infof("TraefikService %s: empty spec, using fallback server %s", name, fallback)
+	}
 
-func processEmptyService(cfg *config.Config, name string, raw json.RawMessage) json.RawMessage {
-	urlStr := getTraefikEnvURL(cfg)
-	if urlStr == "" {
-		logrus.Warnf("TraefikService %s has empty spec and no derivable LB URL; resource will be invalid until populated", name)
-		return raw
+	if lb, ok := spec["loadBalancer"].(map[string]interface{}); ok {
+		return buildLoadBalancerService(namespace, name, lb)
 	}
-	parsed, err := netURLParse(urlStr)
-	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
-		logrus.Warnf("TraefikService %s: invalid derived LB URL '%s': %v", name, urlStr, err)
-		return raw
-	}
-	return buildTraefikServiceSpec(urlStr)
-}
-
-func extractServiceURLs(spec map[string]interface{}) []string {
-	lb, ok := spec["loadBalancer"].(map[string]interface{})
-	if !ok {
-		return nil
-	}
-	servers, ok := lb["servers"].([]interface{})
-	if !ok {
-		return nil
-	}
-	var urls []string
-	for _, s := range servers {
-		if m, ok := s.(map[string]interface{}); ok {
-			if u, ok := m["url"].(string); ok {
-				urls = append(urls, u)
-			}
+	for _, kind := range []string{"weighted", "mirroring", "failover", "highestRandomWeight"} {
+		if _, ok := spec[kind]; ok {
+			markTraefikServiceRefs(spec, all)
+			b, err := json.Marshal(spec)
+			return b, nil, nil, err
 		}
 	}
-	return urls
+	return nil, nil, nil, fmt.Errorf("service %s: no loadBalancer, weighted, mirroring, failover or highestRandomWeight section", name)
 }
 
-func netURLParse(u string) (*url.URL, error) {
-	return url.ParseRequestURI(u)
-}
-
-func buildTraefikServiceSpec(url string) json.RawMessage {
-	built := map[string]interface{}{
-		"loadBalancer": map[string]interface{}{
-			"servers": []interface{}{map[string]interface{}{"url": url}},
-		},
+func buildLoadBalancerService(namespace, name string, lb map[string]interface{}) (json.RawMessage, []*corev1.Service, []*discoveryv1.EndpointSlice, error) {
+	rawServers, _ := lb["servers"].([]interface{})
+	type clusterRef struct {
+		name, scheme string
+		port         int32
 	}
-	b, err := json.Marshal(built)
-	if err != nil {
-		logrus.Warnf("failed to marshal Traefik service for %s: %v", url, err)
-		return []byte("{}")
-	}
-	logrus.Infof("Filled empty TraefikService with server %s", url)
-	return b
-}
-
-func convertLoadBalancerToK8sService(spec map[string]interface{}) (*kubeServiceTarget, bool) {
-	lbServers, ok := extractLBServers(spec)
-	if !ok {
-		return nil, false
-	}
-	target, ok := parseUniformServiceTargets(lbServers)
-	if !ok || target == nil {
-		return nil, false
-	}
-	serviceEntry := map[string]interface{}{
-		"name":      target.name,
-		"namespace": target.namespace,
-		"kind":      "Service",
-		"port":      target.port,
-	}
-	if target.scheme == "https" {
-		serviceEntry["scheme"] = "https"
-	}
-	spec["weighted"] = map[string]interface{}{"services": []interface{}{serviceEntry}}
-	delete(spec, "loadBalancer")
-	return target, true
-}
-
-// extractLBServers validates top-level loadBalancer shape & returns servers list.
-func extractLBServers(spec map[string]interface{}) ([]interface{}, bool) {
-	if len(spec) != 1 {
-		return nil, false
-	}
-	lb, ok := spec["loadBalancer"].(map[string]interface{})
-	if !ok {
-		return nil, false
-	}
-	servers, ok := lb["servers"].([]interface{})
-	if !ok || len(servers) == 0 {
-		return nil, false
-	}
-	for k := range lb { // ensure only 'servers'
-		if k != "servers" {
-			return nil, false
+	clusterRefs := map[clusterRef]int{}
+	var others []backend.Server
+	for i, rs := range rawServers {
+		m, ok := rs.(map[string]interface{})
+		if !ok {
+			return nil, nil, nil, fmt.Errorf("service %s: server %d is not an object", name, i)
 		}
-	}
-	return servers, true
-}
-
-// parseUniformServiceTargets ensures all server URLs point to the same k8s service target.
-func parseUniformServiceTargets(servers []interface{}) (*kubeServiceTarget, bool) {
-	var target *kubeServiceTarget
-	for _, srv := range servers {
-		srvMap, ok := srv.(map[string]interface{})
-		if !ok || len(srvMap) != 1 {
-			return nil, false
+		u, _ := m["url"].(string)
+		if u == "" {
+			return nil, nil, nil, fmt.Errorf("service %s: server %d has no url", name, i)
 		}
-		rawURL, ok := srvMap["url"].(string)
-		if !ok || rawURL == "" {
-			return nil, false
-		}
-		parsed, err := parseKubeServiceURL(rawURL)
+		srv, err := backend.ParseURL(u)
 		if err != nil {
-			return nil, false
+			return nil, nil, nil, fmt.Errorf("service %s: %w", name, err)
 		}
-		if target == nil {
-			target = parsed
+		if svcName, svcNs, ok := backend.IsClusterServiceHost(srv.Host); ok && svcNs == namespace {
+			clusterRefs[clusterRef{name: svcName, scheme: srv.Scheme, port: srv.Port}]++
 			continue
 		}
-		if !target.equals(parsed) {
-			return nil, false
+		others = append(others, srv)
+	}
+
+	opts := map[string]interface{}{}
+	for _, k := range lbChildOptions {
+		if v, ok := lb[k]; ok {
+			opts[k] = v
 		}
 	}
-	return target, target != nil
-}
+	if _, ok := lb["healthCheck"]; ok {
+		// Traefik only honours active health checks on ExternalName Services
+		// and rejects the reference otherwise.
+		logrus.Warnf("TraefikService %s: dropping loadBalancer.healthCheck, Traefik does not support it for Kubernetes Service backends", name)
+	}
 
-func parseKubeServiceURL(rawURL string) (*kubeServiceTarget, error) {
-	parsed, err := netURLParse(rawURL)
+	var children []map[string]interface{}
+	refKeys := make([]clusterRef, 0, len(clusterRefs))
+	for k := range clusterRefs {
+		refKeys = append(refKeys, k)
+	}
+	sort.Slice(refKeys, func(i, j int) bool {
+		a, b := refKeys[i], refKeys[j]
+		if a.name != b.name {
+			return a.name < b.name
+		}
+		if a.port != b.port {
+			return a.port < b.port
+		}
+		return a.scheme < b.scheme
+	})
+	for _, k := range refKeys {
+		children = append(children, childRef(k.name, int64(k.port), k.scheme, clusterRefs[k], opts))
+	}
+
+	var svcs []*corev1.Service
+	var slices []*discoveryv1.EndpointSlice
+	if len(others) > 0 || len(children) == 0 {
+		buckets := backend.Build(backend.Spec{
+			Namespace: namespace,
+			Base:      name,
+			PortName:  HTTPPortName,
+			Protocol:  corev1.ProtocolTCP,
+			Servers:   others,
+		})
+		for _, b := range buckets {
+			svcs = append(svcs, b.Service)
+			slices = append(slices, b.Slices...)
+			children = append(children, childRef(b.Service.Name, HTTPPortName, b.Scheme, b.Weight, opts))
+		}
+	}
+
+	weighted := map[string]interface{}{"services": toInterfaces(children)}
+	if sticky, ok := lb["sticky"].(map[string]interface{}); ok && len(children) > 1 {
+		weighted["sticky"] = outerSticky(sticky)
+	}
+	b, err := json.Marshal(map[string]interface{}{"weighted": weighted})
 	if err != nil {
-		return nil, err
+		return nil, nil, nil, err
 	}
-	if err := validateParsedServiceURL(parsed, rawURL); err != nil {
-		return nil, err
-	}
-	host := parsed.Hostname()
-	parts := strings.Split(host, ".")
-	if len(parts) < 3 {
-		return nil, fmt.Errorf("invalid service reference %q: expected <name>.<namespace>.svc", host)
-	}
-	if parts[0] == "" || parts[1] == "" {
-		return nil, fmt.Errorf("invalid service reference %q: missing name or namespace", host)
-	}
-	if parts[2] != "svc" {
-		return nil, fmt.Errorf("invalid service reference %q: expected .svc segment", host)
-	}
-	name, namespace := parts[0], parts[1]
-	port := derivePort(parsed)
-	return &kubeServiceTarget{name: name, namespace: namespace, port: port, scheme: parsed.Scheme}, nil
+	return b, svcs, slices, nil
 }
 
-// validateParsedServiceURL performs structural validation for a service style URL.
-func validateParsedServiceURL(parsed *url.URL, raw string) error {
-	if parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return fmt.Errorf("unsupported scheme %s", parsed.Scheme)
+func childRef(name string, port interface{}, scheme string, weight int, opts map[string]interface{}) map[string]interface{} {
+	c := map[string]interface{}{
+		"name":   name,
+		"kind":   "Service",
+		"port":   port,
+		"weight": weight,
 	}
-	if (parsed.Path != "" && parsed.Path != "/") || parsed.RawQuery != "" {
-		return fmt.Errorf("unsupported path or query components in %s", raw)
+	if scheme != "" {
+		c["scheme"] = scheme
 	}
-	host := parsed.Hostname()
-	if host == "" {
-		return fmt.Errorf("missing host")
+	for k, v := range opts {
+		c[k] = deepCopyJSON(v)
 	}
-	if !strings.Contains(host, ".svc.") && !strings.HasSuffix(host, ".svc") {
-		return fmt.Errorf("host %s is not a Kubernetes service FQDN", host)
-	}
-	return nil
+	return c
 }
 
-// derivePort returns a port for a parsed service URL.
-func derivePort(parsed *url.URL) int {
-	if p := parsed.Port(); p != "" {
-		if val, err := strconv.Atoi(p); err == nil && val > 0 {
-			return val
+// outerSticky derives the cookie that pins a client to one weighted child.
+// It must differ from the per-child cookie that pins the server inside it.
+func outerSticky(sticky map[string]interface{}) map[string]interface{} {
+	out, _ := deepCopyJSON(sticky).(map[string]interface{})
+	if cookie, ok := out["cookie"].(map[string]interface{}); ok {
+		if n, ok := cookie["name"].(string); ok && n != "" {
+			cookie["name"] = n + "_pool"
 		}
 	}
-	if parsed.Scheme == "https" {
-		return 443
-	}
-	return 80
+	return out
 }
 
-func (t *kubeServiceTarget) equals(other *kubeServiceTarget) bool {
-	if t == nil || other == nil {
-		return false
+// markTraefikServiceRefs gives children of native TraefikService specs that
+// name another Pangolin service the TraefikService kind; the CRD default is a
+// Kubernetes Service.
+func markTraefikServiceRefs(spec map[string]interface{}, all map[string]json.RawMessage) {
+	mark := func(ref map[string]interface{}) {
+		n, _ := ref["name"].(string)
+		if _, known := all[n]; known || sanitize.IsCrossProviderRef(n) {
+			if _, set := ref["kind"]; !set {
+				ref["kind"] = "TraefikService"
+			}
+		}
 	}
-	return t.name == other.name && t.namespace == other.namespace && t.port == other.port && t.scheme == other.scheme
+	for _, section := range []string{"weighted", "highestRandomWeight"} {
+		if w, ok := spec[section].(map[string]interface{}); ok {
+			if list, ok := w["services"].([]interface{}); ok {
+				for _, s := range list {
+					if m, ok := s.(map[string]interface{}); ok {
+						mark(m)
+					}
+				}
+			}
+		}
+	}
+	if mir, ok := spec["mirroring"].(map[string]interface{}); ok {
+		if n, ok := mir["service"].(string); ok {
+			mir["name"] = n
+			delete(mir, "service")
+			mark(mir)
+		}
+		if list, ok := mir["mirrors"].([]interface{}); ok {
+			for _, s := range list {
+				if m, ok := s.(map[string]interface{}); ok {
+					mark(m)
+				}
+			}
+		}
+	}
+}
+
+func toInterfaces(in []map[string]interface{}) []interface{} {
+	out := make([]interface{}, len(in))
+	for i := range in {
+		out[i] = in[i]
+	}
+	return out
+}
+
+func deepCopyJSON(v interface{}) interface{} {
+	switch t := v.(type) {
+	case map[string]interface{}:
+		m := make(map[string]interface{}, len(t))
+		for k, val := range t {
+			m[k] = deepCopyJSON(val)
+		}
+		return m
+	case []interface{}:
+		s := make([]interface{}, len(t))
+		for i, val := range t {
+			s[i] = deepCopyJSON(val)
+		}
+		return s
+	default:
+		return t
+	}
 }
 
 func getTraefikEnvURL(cfg *config.Config) string {

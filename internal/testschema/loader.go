@@ -48,10 +48,10 @@ func TestDataPath(elems ...string) string {
 }
 
 // LoadTraefikCRDs loads all CRD YAMLs for the given version directory
-// (e.g., "v3.5.0") and returns parsed CRD objects. It reads from the repo path
+// (e.g., "v3.7.19") and returns parsed CRD objects. It reads from the repo path
 // test/testdata/crds/traefik/<version> to avoid go:embed constraints.
 // LoadTraefikCRDs loads all CRD YAMLs for the given version directory
-// (e.g., "v3.5.0") and returns parsed CRD objects.
+// (e.g., "v3.7.19") and returns parsed CRD objects.
 // Complexity reduction: delegate file parsing to helper, flatten conditions.
 func LoadTraefikCRDs(version string) ([]*apiextensionsv1.CustomResourceDefinition, error) {
 	dir := filepath.Join(TestDataPath("crds", "traefik"), version)

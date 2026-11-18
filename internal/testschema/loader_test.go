@@ -8,7 +8,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-const crdVersion = "v3.5.0"
+const crdVersion = "v3.5.6"
 
 func TestRepoRootAndTestDataPath(t *testing.T) {
 	root := RepoRoot()
@@ -36,8 +36,8 @@ func TestLoadTraefikCRDsSuccessAndErrors(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadTraefikCRDs error: %v", err)
 	}
-	if len(crds) != 7 {
-		t.Fatalf("expected 7 CRDs for v3.5.0, got %d", len(crds))
+	if len(crds) != 10 {
+		t.Fatalf("expected 10 CRDs for v3.5.6, got %d", len(crds))
 	}
 
 	// Error for missing version directory

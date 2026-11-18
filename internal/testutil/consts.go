@@ -9,7 +9,7 @@ const (
 	ManagedLabelValue          = "pangolin-kube-controller" //NOSONARLINT - No Duplicate
 	ManagedAnnoValue           = "pangolin-kube-controller" //NOSONARLINT - No Duplicate
 	DefaultIngressClass        = "traefik"
-	DefaultCRDVersion          = "v3.5.0"
+	DefaultCRDVersion          = "v3.5.6"
 	TCPTransportName           = "my-tcp-transport"
 	TraefikGroup               = "traefik.io"
 	TraefikVersion             = "v1alpha1"

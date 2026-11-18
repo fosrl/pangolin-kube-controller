@@ -143,8 +143,9 @@ func TestSanitizeTraefikConfigRewritesNestedReferences(t *testing.T) {
 	require.True(t, ok)
 	mwRefs, ok := chain["middlewares"].([]interface{})
 	require.True(t, ok)
-	require.Contains(t, mwRefs, sanitizedRedirectMw)
-	require.Contains(t, mwRefs, "other-middleware")
+	// The Middleware CRD expects MiddlewareRef objects in a chain.
+	require.Contains(t, mwRefs, map[string]interface{}{"name": sanitizedRedirectMw})
+	require.Contains(t, mwRefs, map[string]interface{}{"name": "other-middleware"})
 
 	var router map[string]interface{}
 	require.NoError(t, json.Unmarshal(sanitized.HTTP.Routers["example-router"], &router))
